@@ -273,6 +273,13 @@ export interface BotSessionRepository {
   getById(id: string): Promise<BotSession | undefined>;
   getByTopic(chatId: string, threadId: string): Promise<BotSession | undefined>;
   save(session: BotSession): Promise<void>;
+  updateOwned(
+    session: BotSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean>;
   list(): Promise<readonly BotSession[]>;
 }
 
@@ -305,6 +312,13 @@ export interface ExecutionRepository {
 export interface ExecutorSessionRepository {
   getById(id: string): Promise<ExecutorSession | undefined>;
   save(session: ExecutorSession): Promise<void>;
+  updateOwned(
+    session: ExecutorSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean>;
 }
 
 export interface TelegramTopicRepository {

@@ -548,6 +548,8 @@ export class AgentOrchestrator {
 
     const job: ExecutionJob = { executionId: execution.id };
     if (this.jobQueue) {
+      // save() atomically creates the queued delivery intent; this idempotent enqueue is
+      // a delivery nudge that also supports queue implementations without that transaction.
       await this.jobQueue.enqueue(job);
     } else {
       await this.queue.run(current.id, () => this.processJob(job));
@@ -622,6 +624,7 @@ export class AgentOrchestrator {
       executorSession = current.executorSessionId
         ? await this.persistence.executorSessions.getById(current.executorSessionId)
         : undefined;
+      const createdExecutorSession = !executorSession;
       if (!executorSession) {
         const now = this.clock.now();
         executorSession = {
@@ -633,15 +636,15 @@ export class AgentOrchestrator {
           createdAt: now,
           lastUsedAt: now,
         };
-        await this.assertOwned(active);
-        await this.persistence.executorSessions.save(executorSession);
+      }
+      if (createdExecutorSession) {
+        await this.persistOwnedExecutorSession(active, executorSession);
       }
       await this.persistExecution(active, {
         ...active.execution,
         executorSessionId: executorSession.id,
       });
-      await this.assertOwned(active);
-      await this.persistence.sessions.save({
+      await this.persistOwnedSession(active, {
         ...current,
         executorSessionId: executorSession.id,
         status: "starting",
@@ -686,8 +689,7 @@ export class AgentOrchestrator {
       this.runtimeSessions.set(current.id, agentSession);
       await this.interruptIfAborted(active);
       executorSession = { ...executorSession, lastUsedAt: this.clock.now() };
-      await this.assertOwned(active);
-      await this.persistence.executorSessions.save(executorSession);
+      await this.persistOwnedExecutorSession(active, executorSession);
       if (agentSession.nativeSessionId) {
         executorSession = await this.persistNativeIdentity(
           active,
@@ -703,8 +705,7 @@ export class AgentOrchestrator {
         startedAt: active.execution.startedAt ?? this.clock.now(),
         executorSessionId: executorSession.id,
       });
-      await this.assertOwned(active);
-      await this.persistence.sessions.save({
+      await this.persistOwnedSession(active, {
         ...((await this.persistence.sessions.getById(current.id)) ?? current),
         executorSessionId: executorSession.id,
         status: "running",
@@ -798,6 +799,23 @@ export class AgentOrchestrator {
       ...(executorSessionId ? { executorSessionId } : {}),
       ownerFence: active.lease.fence,
     };
+    const current = await this.persistence.sessions.getById(active.execution.botSessionId);
+    const sessionStatus =
+      current?.status === "closed"
+        ? "closed"
+        : finalStatus.status === "completed"
+          ? "idle"
+          : finalStatus.status === "stopped"
+            ? "stopped"
+            : "failed";
+    if (current) {
+      await this.persistOwnedSession(active, {
+        ...current,
+        ...(executorSessionId ? { executorSessionId } : {}),
+        status: sessionStatus,
+        updatedAt: finishedAt,
+      });
+    }
     const updated = await this.persistence.executions.updateOwned(
       finalExecution,
       active.lease.ownerId,
@@ -809,23 +827,6 @@ export class AgentOrchestrator {
       return;
     }
     active.execution = finalExecution;
-    const current = await this.persistence.sessions.getById(active.execution.botSessionId);
-    const sessionStatus =
-      current?.status === "closed"
-        ? "closed"
-        : finalStatus.status === "completed"
-          ? "idle"
-          : finalStatus.status === "stopped"
-            ? "stopped"
-            : "failed";
-    if (current) {
-      await this.persistence.sessions.save({
-        ...current,
-        ...(executorSessionId ? { executorSessionId } : {}),
-        status: sessionStatus,
-        updatedAt: finishedAt,
-      });
-    }
     if (renderer) {
       await renderer.complete(
         finalStatus.status === "completed"
@@ -870,8 +871,7 @@ export class AgentOrchestrator {
         });
         const current = await this.persistence.sessions.getById(active.execution.botSessionId);
         if (current && current.status !== "closed") {
-          await this.assertOwned(active);
-          await this.persistence.sessions.save({
+          await this.persistOwnedSession(active, {
             ...current,
             executorSessionId: executorSession.id,
             status: "awaiting_approval",
@@ -913,24 +913,53 @@ export class AgentOrchestrator {
         nativeSessionId,
       );
     }
-    await this.assertOwned(active);
     const updated = {
       ...executorSession,
       nativeSessionId,
       resumable: executorSession.resumable || resumable,
       lastUsedAt: this.clock.now(),
     };
-    await this.persistence.executorSessions.save(updated);
+    await this.persistOwnedExecutorSession(active, updated);
     const session = await this.persistence.sessions.getById(active.execution.botSessionId);
     if (session && session.status !== "closed") {
-      await this.assertOwned(active);
-      await this.persistence.sessions.save({
+      await this.persistOwnedSession(active, {
         ...session,
         executorSessionId: executorSession.id,
         updatedAt: this.clock.now(),
       });
     }
     return updated;
+  }
+
+  private async persistOwnedSession(active: ActiveExecution, session: BotSession): Promise<void> {
+    const updated = await this.persistence.sessions.updateOwned(
+      session,
+      active.execution.id,
+      active.lease.ownerId,
+      active.lease.fence,
+      this.clock.now(),
+    );
+    if (!updated) {
+      active.ownershipLost = true;
+      throw new StaleExecutionOwnershipError();
+    }
+  }
+
+  private async persistOwnedExecutorSession(
+    active: ActiveExecution,
+    session: ExecutorSession,
+  ): Promise<void> {
+    const updated = await this.persistence.executorSessions.updateOwned(
+      session,
+      active.execution.id,
+      active.lease.ownerId,
+      active.lease.fence,
+      this.clock.now(),
+    );
+    if (!updated) {
+      active.ownershipLost = true;
+      throw new StaleExecutionOwnershipError();
+    }
   }
 
   private async renewLease(active: ActiveExecution): Promise<void> {

@@ -71,8 +71,8 @@ M3 separa intent durable e delivery:
 
 ```text
 Telegram update
-  → persist immutable Execution(pending)
-  → enqueue { executionId } in SQLite execution_jobs
+  → persist immutable Execution(pending) + durable delivery intent atomically
+  → idempotent enqueue nudge for { executionId } in SQLite execution_jobs
   → worker reloads SQLite state
   → atomic claim(session serialization + ownerId + monotonic ownerFence + lease)
   → BotSession starting/running
@@ -84,7 +84,7 @@ Telegram update
 
 ExecutionJobQueue e ExecutionJobWorker sono porte applicative; l’application layer non conosce BullMQ, Redis o lo schema della coda. La composizione M3 usa un worker SQLite con concorrenza configurabile. SQLite resta la verità per execution, sessioni, identity native, cancellation e ownership; la tabella job trasporta soltanto l’intent stabile executionId.
 
-La claim atomica impedisce due execution attive per lo stesso BotSession, mentre worker slot diversi possono eseguire sessioni diverse. Ogni lease renewal e ogni update autorevole verifica ownerId + ownerFence; un worker stale non può finalizzare o mutare l’execution dopo un nuovo claim.
+La claim atomica impedisce due execution attive per lo stesso BotSession, mentre worker slot diversi possono eseguire sessioni diverse. Ogni lease renewal e ogni update autorevole verifica ownerId + ownerFence; un worker stale non può finalizzare o mutare l’execution dopo un nuovo claim. Il lease di `execution_jobs` governa la consegna durevole; il lease con fence di `executions` governa l’autorità sulle mutazioni di orchestrazione. La redelivery di un job scaduto può reclamare solo la consegna: se anche l’Execution è scaduta, `claim` la riconcilia come `unknown` senza riavviare il provider.
 
 ## Capability reali verificate
 

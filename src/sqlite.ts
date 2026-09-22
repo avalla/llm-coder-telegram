@@ -124,6 +124,8 @@ export class SqlitePersistence implements Persistence {
   }
 }
 
+// Job leases govern delivery ownership; execution leases/fences govern authority to mutate
+// orchestration state. Reclaiming either lease never authorizes provider replay.
 const DEFAULT_JOB_LEASE_MS = 30_000;
 const DEFAULT_JOB_POLL_MS = 25;
 
@@ -239,12 +241,16 @@ export class SqliteExecutionJobQueue implements ExecutionJobQueue, ExecutionJobW
         .query<ExecutionJobRow, any>(
           `SELECT execution_jobs.* FROM execution_jobs
            JOIN executions ON executions.id = execution_jobs.execution_id
-           WHERE executions.status='pending' AND
-             ((execution_jobs.status='queued' AND execution_jobs.available_at <= ?) OR
-              (execution_jobs.status='processing' AND execution_jobs.lease_expires_at IS NOT NULL AND execution_jobs.lease_expires_at <= ?))
+           WHERE (
+             executions.status='pending' OR
+             (executions.status IN ('running', 'awaiting_approval') AND
+              executions.lease_expires_at IS NOT NULL AND executions.lease_expires_at <= ?)
+           ) AND
+           ((execution_jobs.status='queued' AND execution_jobs.available_at <= ?) OR
+            (execution_jobs.status='processing' AND execution_jobs.lease_expires_at IS NOT NULL AND execution_jobs.lease_expires_at <= ?))
            ORDER BY execution_jobs.available_at, execution_jobs.created_at, execution_jobs.execution_id LIMIT 1`,
         )
-        .get(now, now);
+        .get(now, now, now);
       if (!row) {
         this.db.run("COMMIT");
         return undefined;
@@ -651,6 +657,54 @@ class SqliteExecutorSessions implements ExecutorSessionRepository {
         session.lastUsedAt.getTime(),
       );
   }
+
+  async updateOwned(
+    session: ExecutorSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    const result = this.db
+      .query(
+        `INSERT INTO executor_sessions
+           (id, executor_id, native_session_id, project_id, workspace_path, host_id,
+            legacy_runtime_session_id, resumable, created_at, last_used_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM executions
+           WHERE id=? AND (executor_session_id IS NULL OR executor_session_id=?)
+             AND owner_id=? AND owner_fence=? AND lease_expires_at > ?
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           executor_id=excluded.executor_id,
+           native_session_id=excluded.native_session_id,
+           project_id=excluded.project_id,
+           workspace_path=excluded.workspace_path,
+           host_id=excluded.host_id,
+           legacy_runtime_session_id=excluded.legacy_runtime_session_id,
+           resumable=excluded.resumable,
+           last_used_at=excluded.last_used_at`,
+      )
+      .run(
+        session.id,
+        session.executorId,
+        session.nativeSessionId ?? null,
+        session.projectId,
+        session.workspacePath,
+        session.hostId ?? null,
+        session.legacyRuntimeSessionId ?? null,
+        session.resumable ? 1 : 0,
+        session.createdAt.getTime(),
+        session.lastUsedAt.getTime(),
+        executionId,
+        session.id,
+        ownerId,
+        fence,
+        now.getTime(),
+      );
+    return result.changes === 1;
+  }
 }
 
 function mapExecutorSession(row: ExecutorSessionRow): ExecutorSession {
@@ -708,6 +762,42 @@ class SqliteSessions implements BotSessionRepository {
         session.createdAt.getTime(),
         session.updatedAt.getTime(),
       );
+  }
+
+  async updateOwned(
+    session: BotSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    const result = this.db
+      .query(
+        `UPDATE bot_sessions
+         SET telegram_chat_id=?, telegram_thread_id=?, executor_id=?, project_id=?,
+             workspace_path=?, executor_session_id=?, status=?, updated_at=?
+         WHERE id=? AND EXISTS (
+           SELECT 1 FROM executions
+           WHERE id=? AND bot_session_id=bot_sessions.id AND owner_id=? AND owner_fence=?
+             AND lease_expires_at > ?
+         )`,
+      )
+      .run(
+        session.telegramChatId,
+        session.telegramThreadId,
+        session.executorId,
+        session.projectId,
+        session.workspacePath,
+        session.executorSessionId ?? null,
+        session.status,
+        session.updatedAt.getTime(),
+        session.id,
+        executionId,
+        ownerId,
+        fence,
+        now.getTime(),
+      );
+    return result.changes === 1;
   }
 
   async list(): Promise<readonly BotSession[]> {
@@ -778,6 +868,7 @@ class SqliteExecutions implements ExecutionRepository {
           execution.cancelRequestedAt?.getTime() ?? null,
           execution.cancelRequestedByUserId ?? null,
         );
+      // A pending execution and its delivery intent commit as one durable unit.
       if (execution.status === "pending") {
         const now = Date.now();
         this.db

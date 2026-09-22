@@ -43,6 +43,7 @@ export class FakeAgentExecutor implements AgentExecutor {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly knownNativeSessionIds = new Set<string>();
   private readonly streamGates: Promise<void>[] = [];
+  private readonly streamGatesByPrompt = new Map<string, Promise<void>[]>();
   private script: readonly AgentEvent[] | undefined;
   private readonly startGate: Promise<void> | undefined;
   private readonly resumeGate: Promise<void> | undefined;
@@ -59,6 +60,12 @@ export class FakeAgentExecutor implements AgentExecutor {
 
   queueStreamGate(gate: Promise<void>): void {
     this.streamGates.push(gate);
+  }
+
+  queueStreamGateForPrompt(prompt: string, gate: Promise<void>): void {
+    const gates = this.streamGatesByPrompt.get(prompt) ?? [];
+    gates.push(gate);
+    this.streamGatesByPrompt.set(prompt, gates);
   }
 
   setScript(script: readonly AgentEvent[]): void {
@@ -90,7 +97,9 @@ export class FakeAgentExecutor implements AgentExecutor {
   async *send(session: AgentSession, input: AgentInput): AsyncIterable<AgentEvent> {
     if (!this.sessions.has(session.runtimeSessionId)) throw new Error("Unknown fake session");
     this.sends.push({ session, input });
-    const gate = this.streamGates.shift();
+    const promptGates = this.streamGatesByPrompt.get(input.prompt);
+    const gate = promptGates?.shift() ?? this.streamGates.shift();
+    if (promptGates?.length === 0) this.streamGatesByPrompt.delete(input.prompt);
     if (gate) await abortableWait(gate, input.signal);
 
     const events = this.script ?? [
@@ -215,9 +224,9 @@ export class InMemoryChatGateway implements ChatGateway {
 
 export class InMemoryPersistence implements Persistence {
   readonly projects = new InMemoryProjects();
-  readonly sessions = new InMemorySessions();
   readonly executions = new InMemoryExecutions();
-  readonly executorSessions = new InMemoryExecutorSessions();
+  readonly sessions = new InMemorySessions(this.executions);
+  readonly executorSessions = new InMemoryExecutorSessions(this.executions);
   readonly topics = new InMemoryTopics();
   readonly audit = new InMemoryAuditLog();
 }
@@ -237,6 +246,9 @@ class InMemoryProjects implements ProjectRepository {
 
 class InMemorySessions implements BotSessionRepository {
   private readonly values = new Map<string, BotSession>();
+
+  constructor(private readonly executions: InMemoryExecutions) {}
+
   async getById(id: string): Promise<BotSession | undefined> {
     return this.values.get(id);
   }
@@ -248,6 +260,29 @@ class InMemorySessions implements BotSessionRepository {
   async save(session: BotSession): Promise<void> {
     this.values.set(session.id, session);
   }
+
+  async updateOwned(
+    session: BotSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    const execution = await this.executions.getById(executionId);
+    if (
+      !execution ||
+      execution.botSessionId !== session.id ||
+      execution.ownerId !== ownerId ||
+      execution.ownerFence !== fence ||
+      !execution.leaseExpiresAt ||
+      execution.leaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    this.values.set(session.id, session);
+    return true;
+  }
+
   async list(): Promise<readonly BotSession[]> {
     return [...this.values.values()];
   }
@@ -423,12 +458,36 @@ class InMemoryExecutions implements ExecutionRepository {
 export class InMemoryExecutorSessions implements ExecutorSessionRepository {
   private readonly values = new Map<string, ExecutorSession>();
 
+  constructor(private readonly executions: InMemoryExecutions) {}
+
   async getById(id: string): Promise<ExecutorSession | undefined> {
     return this.values.get(id);
   }
 
   async save(session: ExecutorSession): Promise<void> {
     this.values.set(session.id, session);
+  }
+
+  async updateOwned(
+    session: ExecutorSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    const execution = await this.executions.getById(executionId);
+    if (
+      !execution ||
+      (execution.executorSessionId && execution.executorSessionId !== session.id) ||
+      execution.ownerId !== ownerId ||
+      execution.ownerFence !== fence ||
+      !execution.leaseExpiresAt ||
+      execution.leaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    this.values.set(session.id, session);
+    return true;
   }
 }
 

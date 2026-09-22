@@ -1,0 +1,261 @@
+export type Role = "owner" | "operator" | "viewer";
+
+export type BotSessionStatus =
+  "idle" | "starting" | "running" | "awaiting_approval" | "failed" | "stopped" | "closed";
+
+export type ExecutionStatus =
+  | "pending"
+  | "running"
+  | "awaiting_approval"
+  | "completed"
+  | "failed"
+  | "stopped"
+  | "interrupted"
+  | "unknown";
+
+export type TopicStatus = "open" | "closed" | "deleted";
+
+export interface Project {
+  id: string;
+  name: string;
+  workspacePath: string;
+  allowedExecutorIds: readonly string[];
+}
+
+export interface BotSession {
+  id: string;
+  telegramChatId: string;
+  telegramThreadId: string;
+  executorId: string;
+  projectId: string;
+  workspacePath: string;
+  agentSessionId?: string;
+  status: BotSessionStatus;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface Execution {
+  id: string;
+  botSessionId: string;
+  requestedByUserId: string;
+  prompt: string;
+  status: ExecutionStatus;
+  correlationId: string;
+  agentSessionId?: string;
+  startedAt?: Date;
+  finishedAt?: Date;
+  errorMessage?: string;
+}
+
+export interface ExecutorSession {
+  id: string;
+  executorId: string;
+  projectId: string;
+  workspacePath: string;
+  externalSessionId?: string;
+  createdAt: Date;
+}
+
+export interface TelegramTopic {
+  chatId: string;
+  threadId: string;
+  sessionId?: string;
+  kind: "control" | "workspace";
+  title: string;
+  status: TopicStatus;
+  updatedAt: Date;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  executionId: string;
+  action: string;
+  details: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  requestedAt: Date;
+  resolvedAt?: Date;
+  resolvedByUserId?: string;
+}
+
+export interface AgentSession {
+  id: string;
+  executorId: string;
+  projectId: string;
+  workspacePath: string;
+  externalSessionId?: string;
+  createdAt: Date;
+}
+
+export interface StartSessionOptions {
+  projectId: string;
+  workspacePath: string;
+  model?: string;
+  signal?: AbortSignal;
+}
+
+export interface ResumeSessionOptions extends StartSessionOptions {
+  externalSessionId: string;
+}
+
+export interface AgentAttachment {
+  id: string;
+  filename: string;
+  mimeType: string;
+  localPath: string;
+}
+
+export interface AgentInput {
+  prompt: string;
+  model?: string;
+  attachments?: readonly AgentAttachment[];
+  signal?: AbortSignal;
+}
+
+export interface ExecutorCapabilities {
+  resume: boolean;
+  streaming: boolean;
+  approvals: boolean;
+  models: boolean;
+  fileAttachments: boolean;
+  structuredOutput: boolean;
+  worktrees: boolean;
+}
+
+export interface AgentEventBase {
+  timestamp: Date;
+  sequence: number;
+}
+
+export type AgentEvent =
+  | (AgentEventBase & { type: "text_delta"; text: string })
+  | (AgentEventBase & { type: "thinking"; text: string })
+  | (AgentEventBase & {
+      type: "tool_call";
+      toolName: string;
+      inputSummary: string;
+    })
+  | (AgentEventBase & { type: "tool_result"; toolName: string; summary: string })
+  | (AgentEventBase & { type: "command"; command: string; cwd?: string })
+  | (AgentEventBase & {
+      type: "file_changed";
+      path: string;
+      change: "created" | "modified" | "deleted";
+    })
+  | (AgentEventBase & {
+      type: "approval_request";
+      approvalId: string;
+      action: string;
+      details: string;
+    })
+  | (AgentEventBase & {
+      type: "usage";
+      inputTokens?: number;
+      outputTokens?: number;
+      costUsd?: number;
+    })
+  | (AgentEventBase & { type: "error"; message: string; retryable: boolean })
+  | (AgentEventBase & {
+      type: "completed";
+      summary?: string;
+      exitCode?: number;
+    });
+
+export interface AgentExecutor {
+  readonly id: string;
+  readonly name: string;
+  capabilities(): ExecutorCapabilities;
+  start(options: StartSessionOptions): Promise<AgentSession>;
+  send(session: AgentSession, input: AgentInput): AsyncIterable<AgentEvent>;
+  interrupt(session: AgentSession): Promise<void>;
+  close(session: AgentSession): Promise<void>;
+  resume?(options: ResumeSessionOptions): Promise<AgentSession>;
+}
+
+export interface IncomingMessage {
+  chatId: string;
+  threadId?: string;
+  userId: string;
+  text: string;
+  messageId?: string;
+}
+
+export interface MessageRef {
+  chatId: string;
+  messageId: string;
+  threadId?: string;
+}
+
+export interface TopicRef {
+  chatId: string;
+  threadId: string;
+  title: string;
+}
+
+export interface InlineButton {
+  label: string;
+  callbackData: string;
+}
+
+export interface ChatMessageOptions {
+  buttons?: readonly (readonly InlineButton[])[];
+}
+
+export interface ChatGateway {
+  sendMessage(
+    target: { chatId: string; threadId?: string },
+    text: string,
+    options?: ChatMessageOptions,
+  ): Promise<MessageRef>;
+  editMessage(message: MessageRef, text: string, options?: ChatMessageOptions): Promise<void>;
+  sendDocument(
+    target: { chatId: string; threadId?: string },
+    filename: string,
+    content: string,
+  ): Promise<void>;
+  createTopic(chatId: string, title: string): Promise<TopicRef>;
+  closeTopic(topic: TopicRef): Promise<void>;
+}
+
+export interface ProjectRepository {
+  getById(id: string): Promise<Project | undefined>;
+  list(): Promise<readonly Project[]>;
+}
+
+export interface BotSessionRepository {
+  getById(id: string): Promise<BotSession | undefined>;
+  getByTopic(chatId: string, threadId: string): Promise<BotSession | undefined>;
+  save(session: BotSession): Promise<void>;
+  list(): Promise<readonly BotSession[]>;
+}
+
+export interface ExecutionRepository {
+  getById(id: string): Promise<Execution | undefined>;
+  save(execution: Execution): Promise<void>;
+  listBySession(sessionId: string): Promise<readonly Execution[]>;
+}
+
+export interface TelegramTopicRepository {
+  get(chatId: string, threadId: string): Promise<TelegramTopic | undefined>;
+  save(topic: TelegramTopic): Promise<void>;
+}
+
+export interface AuditLog {
+  append(entry: {
+    action: string;
+    userId?: string;
+    chatId?: string;
+    sessionId?: string;
+    executionId?: string;
+    correlationId: string;
+    metadata?: Readonly<Record<string, string>>;
+  }): Promise<void>;
+}
+
+export interface Persistence {
+  projects: ProjectRepository;
+  sessions: BotSessionRepository;
+  executions: ExecutionRepository;
+  topics: TelegramTopicRepository;
+  audit: AuditLog;
+}

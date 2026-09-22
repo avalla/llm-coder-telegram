@@ -55,26 +55,36 @@ Su POSIX ogni provider è il leader di un process group dedicato (`detached` + s
 
 ## Lifecycle
 
+M2 aveva questa esecuzione logica:
+
 ```text
-Telegram update
-  → Telegram adapter normalizza chatId/threadId/userId/text
-  → TelegramTopic/BotSession lookup
-  → AuthorizationService (chat + user ID + ruolo)
-  → supervised task dispatch (polling non attende l’executor)
-  → SessionQueue serializza per BotSession; topic diversi possono procedere in parallelo
-  → reload authoritative BotSession dentro la coda
-  → Execution pending → starting/running
-  → ExecutorRegistry seleziona adapter
-  → AgentExecutor.start/resume con AbortSignal
-  → AgentExecutor.send → ProcessRunner.spawn senza shell
-  → AgentEvent normalizzati
-  → `session_identity` → persist native ID immediatamente
-  → ThrottledEventRenderer aggiorna un solo messaggio
-  → terminal event/abort/EOF → Execution completed/failed/stopped/unknown + BotSession idle/failed/stopped
-  → audit + persistence
+pending
+  → BotSession starting
+  → running
+  → awaiting_approval (eventuale)
+  → completed | failed | stopped | unknown
 ```
 
-Una seconda richiesta nello stesso topic aspetta la prima; topic diversi non condividono la coda.
+Lo stato autorevole di Execution, BotSession, ExecutorSession e audit è persistito in SQLite. Prima di M3, invece, la coda per sessione, active, gli AbortController, i runtime handle provider e la conoscenza dei processi in corso vivevano solo nella memoria del processo. Un restart poteva quindi perdere prompt pending, ownership e intenti di cancellation; i PID non erano una fonte di recovery affidabile.
+
+M3 separa intent durable e delivery:
+
+```text
+Telegram update
+  → persist immutable Execution(pending)
+  → enqueue { executionId } in SQLite execution_jobs
+  → worker reloads SQLite state
+  → atomic claim(session serialization + ownerId + monotonic ownerFence + lease)
+  → BotSession starting/running
+  → AgentExecutor.start/resume with persisted native identity
+  → stream events and fenced persistence
+  → completed | failed | stopped | unknown
+  → queue job acknowledged
+```
+
+ExecutionJobQueue e ExecutionJobWorker sono porte applicative; l’application layer non conosce BullMQ, Redis o lo schema della coda. La composizione M3 usa un worker SQLite con concorrenza configurabile. SQLite resta la verità per execution, sessioni, identity native, cancellation e ownership; la tabella job trasporta soltanto l’intent stabile executionId.
+
+La claim atomica impedisce due execution attive per lo stesso BotSession, mentre worker slot diversi possono eseguire sessioni diverse. Ogni lease renewal e ogni update autorevole verifica ownerId + ownerFence; un worker stale non può finalizzare o mutare l’execution dopo un nuovo claim.
 
 ## Capability reali verificate
 
@@ -93,10 +103,17 @@ Le permission prompt interattive non vengono ricostruite da testo umano: Claude 
 
 ## Recovery, `/session` e cancellation
 
-Dopo restart, `BotSession.executorSessionId` ricarica `ExecutorSession.nativeSessionId`; se l’ID esiste ma resume non è supportato, l’execution fallisce chiusa e l’adapter non avvia una sessione nuova. `/session` mostra topic Telegram, runtime ID se attivo, executor, native ID, stato, execution attiva e supporto resume; non mostra environment, token, raw argv o path sensibili.
+Dopo restart, M3 esegue una recovery deterministica prima di avviare il worker:
 
-`/stop` stabilisce l’autorità di cancellazione prima di `start`/`resume`, passa il signal a start/resume/send, invia `interrupt` quando esiste un runtime handle e persiste `stopped`. `ProcessRunner` chiede graceful termination, poi forza `SIGKILL` dopo una grace period iniettata. L’EOF osservato dopo abort resta `stopped`; EOF senza terminale resta `unknown`. `/close` è serializzato e rifiuta un execution attivo.
+- execution `pending` viene resa nuovamente claimable e il suo solo `executionId` viene re-enqueued;
+- execution `running` o `awaiting_approval` viene chiusa come `unknown` con audit `execution.recovered_unknown`; non si deduce lo stato dal PID e non si riavvia un prompt potenzialmente parzialmente eseguito;
+- un lease contiene `ownerId`, `ownerFence` monotono e scadenza; update/terminalizzazione con fence stale falliscono senza effetti;
+- cancellation intent è persistito prima di interrompere il runtime. Un job pending cancellato diventa `stopped` senza avviare il provider; un job running viene osservato anche da un worker diverso e riceve abort/interrupt.
+
+`BotSession.executorSessionId` continua a ricaricare `ExecutorSession.nativeSessionId`; l’identità native M2 resta autorevole e non viene sostituita durante resume o stream. `/session` mostra topic Telegram, runtime ID se attivo, executor, native ID, stato, execution attiva e supporto resume; non mostra environment, token, raw argv o path sensibili.
+
+`ProcessRunner` conserva graceful termination e bounded `SIGKILL`. L’EOF osservato dopo abort resta `stopped`; EOF senza terminale resta `unknown`. `/close` consulta lo stato persistito e rifiuta un execution active anche se il worker appartiene a un altro processo.
 
 ## Deferred
 
-Approval inline, attachment storage, worktree lifecycle, webhook Telegram e reconciliation di rename/close/delete dei topic, PostgreSQL/Supabase, recovery dei PID e Redis/BullMQ sono fuori da M2. Il polling corrente normalizza solo messaggi testuali.
+Approval inline, attachment storage, worktree lifecycle, webhook Telegram e reconciliation di rename/close/delete dei topic, PostgreSQL/Supabase, Redis/BullMQ come trasporto alternativo e multi-host process supervision sono fuori da M3. Il polling corrente normalizza solo messaggi testuali.

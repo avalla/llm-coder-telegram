@@ -7,7 +7,7 @@ import {
 } from "./application.js";
 import { ClaudeCodeExecutor, CodexCliExecutor } from "./provider-adapters.js";
 import { parseProjects, parseUsers } from "./config.js";
-import { SqlitePersistence } from "./sqlite.js";
+import { SqliteExecutionJobQueue, SqlitePersistence } from "./sqlite.js";
 import { TelegramApiGateway, runTelegramPolling } from "./telegram.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -39,12 +39,21 @@ const gateway = new TelegramApiGateway(token);
 const registry = new InMemoryExecutorRegistry();
 registry.register(new CodexCliExecutor());
 registry.register(new ClaudeCodeExecutor());
+const configuredConcurrency = Number.parseInt(process.env.BOT_EXECUTION_CONCURRENCY ?? "4", 10);
+const jobQueue = new SqliteExecutionJobQueue(persistence.db, {
+  concurrency: Number.isFinite(configuredConcurrency) ? configuredConcurrency : 4,
+});
 const orchestrator = new AgentOrchestrator(
   persistence,
   registry,
   gateway,
   new AuthorizationService({ allowedChatIds: [chatId], users: parseUsers(usersJson) }),
+  undefined,
+  undefined,
+  jobQueue,
+  jobQueue,
 );
+await orchestrator.start();
 
 const abort = new AbortController();
 const shutdown = () => {
@@ -53,5 +62,9 @@ const shutdown = () => {
 };
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
-await runTelegramPolling(gateway, (message) => orchestrator.handleMessage(message), abort.signal);
-await orchestrator.shutdown();
+try {
+  await runTelegramPolling(gateway, (message) => orchestrator.handleMessage(message), abort.signal);
+} finally {
+  await orchestrator.shutdown();
+  persistence.db.close();
+}

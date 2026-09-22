@@ -1,13 +1,13 @@
 # Telegram Coding Agent Bot
 
-Bot Telegram pluggabile per pilotare coding agent CLI tramite Forum Topics. M2 aggiunge adapter reali Codex e Claude Code; il core resta provider-neutral.
+Bot Telegram pluggabile per pilotare coding agent CLI tramite Forum Topics. M3 aggiunge orchestrazione durable e recovery restart-safe; il core resta provider-neutral.
 
-## Stato M2
+## Stato M3
 
 - dominio tipizzato: `Project`, `BotSession`, `Execution`, runtime `AgentSession`, persisted `ExecutorSession`, `TelegramTopic`, `ApprovalRequest`;
 - native provider identity discovered from the event stream and persisted separately from Telegram/runtime IDs;
 - registry di executor senza `switch` sul provider;
-- coda seriale per `BotSession`, concorrenza tra sessioni diverse, polling Telegram supervisionato;
+- execution orchestration durable tramite porte `ExecutionJobQueue`/`ExecutionJobWorker` e outbox SQLite; claim atomica per `BotSession`, concorrenza tra sessioni diverse, polling Telegram supervisionato;
 - authorization server-side per chat/user/ruolo;
 - gateway Telegram nativo via `fetch`, con `message_thread_id`, creazione e chiusura topic; topic rename/delete reconciliation è differita;
 - SQLite persistence tramite `bun:sqlite`;

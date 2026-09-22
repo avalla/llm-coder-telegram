@@ -29,7 +29,7 @@ export interface BotSession {
   executorId: string;
   projectId: string;
   workspacePath: string;
-  agentSessionId?: string;
+  executorSessionId?: string;
   status: BotSessionStatus;
   createdAt: Date;
   updatedAt: Date;
@@ -42,7 +42,7 @@ export interface Execution {
   prompt: string;
   status: ExecutionStatus;
   correlationId: string;
-  agentSessionId?: string;
+  executorSessionId?: string;
   startedAt?: Date;
   finishedAt?: Date;
   errorMessage?: string;
@@ -53,8 +53,12 @@ export interface ExecutorSession {
   executorId: string;
   projectId: string;
   workspacePath: string;
-  externalSessionId?: string;
+  legacyRuntimeSessionId?: string;
+  nativeSessionId?: string;
+  hostId?: string;
+  resumable: boolean;
   createdAt: Date;
+  lastUsedAt: Date;
 }
 
 export interface TelegramTopic {
@@ -79,11 +83,12 @@ export interface ApprovalRequest {
 }
 
 export interface AgentSession {
-  id: string;
+  runtimeSessionId: string;
   executorId: string;
   projectId: string;
   workspacePath: string;
-  externalSessionId?: string;
+  nativeSessionId?: string;
+  resumable?: boolean;
   createdAt: Date;
 }
 
@@ -95,7 +100,7 @@ export interface StartSessionOptions {
 }
 
 export interface ResumeSessionOptions extends StartSessionOptions {
-  externalSessionId: string;
+  nativeSessionId: string;
 }
 
 export interface AgentAttachment {
@@ -114,6 +119,9 @@ export interface AgentInput {
 
 export interface ExecutorCapabilities {
   resume: boolean;
+  interrupt: boolean;
+  close: boolean;
+  sessionIdentity: boolean;
   streaming: boolean;
   approvals: boolean;
   models: boolean;
@@ -149,6 +157,11 @@ export type AgentEvent =
       details: string;
     })
   | (AgentEventBase & {
+      type: "session_identity";
+      nativeSessionId: string;
+      resumable: boolean;
+    })
+  | (AgentEventBase & {
       type: "usage";
       inputTokens?: number;
       outputTokens?: number;
@@ -170,6 +183,7 @@ export interface AgentExecutor {
   interrupt(session: AgentSession): Promise<void>;
   close(session: AgentSession): Promise<void>;
   resume?(options: ResumeSessionOptions): Promise<AgentSession>;
+  describeSession?(session: ExecutorSession): { resumeCommand?: string };
 }
 
 export interface IncomingMessage {
@@ -235,6 +249,11 @@ export interface ExecutionRepository {
   listBySession(sessionId: string): Promise<readonly Execution[]>;
 }
 
+export interface ExecutorSessionRepository {
+  getById(id: string): Promise<ExecutorSession | undefined>;
+  save(session: ExecutorSession): Promise<void>;
+}
+
 export interface TelegramTopicRepository {
   get(chatId: string, threadId: string): Promise<TelegramTopic | undefined>;
   save(topic: TelegramTopic): Promise<void>;
@@ -256,6 +275,7 @@ export interface Persistence {
   projects: ProjectRepository;
   sessions: BotSessionRepository;
   executions: ExecutionRepository;
+  executorSessions: ExecutorSessionRepository;
   topics: TelegramTopicRepository;
   audit: AuditLog;
 }

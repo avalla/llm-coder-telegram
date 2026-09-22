@@ -9,30 +9,47 @@ La gerarchia Telegram è:
 ```text
 Supergroup forum
 ├── Control                 TelegramTopic(kind=control)
-├── [Codex] ai-office · PR61   TelegramTopic → BotSession → AgentSession
+├── [Codex] ai-office · PR61   TelegramTopic → BotSession → ExecutorSession → runtime AgentSession
 ├── [Claude] ai-office · storage
 └── [Codex] autoepoque · PR98
 ```
 
 `chatId + threadId` è una chiave persistente di routing. Un topic operativo indica un logical workspace/session, non un provider: il provider è `BotSession.executorId`.
 
+```mermaid
+flowchart TD
+  T[Telegram topic] --> B[BotSession]
+  B --> E[ExecutorSession]
+  E --> A[Provider adapter]
+  A --> C[Codex / Claude native session]
+  R[AgentSession.runtimeSessionId] -. runtime-only handle .-> A
+  E -. nativeSessionId persisted .-> C
+```
+
+Le due frecce verso sessioni runtime/native sono intenzionalmente distinte.
+
 ## Modello di dominio
 
 - `Project`: allowlist di workspace e executor consentiti.
 - `BotSession`: identità logica del topic; lega progetto, executor e directory controllata.
 - `Execution`: singolo prompt/run, con stato, correlation ID, utente e tempi.
-- `AgentSession`: conversazione persistente del provider quando supportata; il suo ID non viene usato come routing Telegram.
-- `ExecutorSession`: forma persistibile per metadata provider; nella slice è rappresentata dall’`AgentSession` runtime.
+- `AgentSession`: handle runtime del provider (`runtimeSessionId`), valido solo per l’executor corrente.
+- `ExecutorSession`: record persistito con `executorId`, optional `nativeSessionId`, progetto/workspace, host, `resumable`, `createdAt` e `lastUsedAt`; il native ID non viene inventato prima che il provider lo riveli.
+- `BotSession.executorSessionId` e `Execution.executorSessionId` indicano il record persistito, non un runtime handle o un native provider ID.
 - `TelegramTopic`: mapping e stato del topic, inclusi `control`, `closed` e `deleted`.
 - `ApprovalRequest`: contratto per mediare approval native dell’executor in una futura UI inline.
 
-La relazione importante è `BotSession 1 → N Execution`, mentre più execution possono riusare un `AgentSession` nativo.
+La relazione importante è `BotSession 1 → N Execution`, mentre più execution possono riusare lo stesso `ExecutorSession` e quindi la stessa conversazione nativa quando `resumable` è true.
 
 ## Contratti
 
-`AgentExecutor` espone `start`, `send`, `interrupt`, `close` e un `resume` opzionale. `send` restituisce `AsyncIterable<AgentEvent>`, così il core non deve sapere se l’executor usa stdout JSONL, stdin streaming o un SDK.
+`AgentExecutor` espone `start`, `send`, `interrupt`, `close` e un `resume` opzionale. `ExecutorCapabilities` dichiara resume, interrupt, close, identity discovery e structured streaming; l’application layer rifiuta un resume quando la capability non è disponibile. `send` restituisce `AsyncIterable<AgentEvent>`, così il core non deve sapere se l’executor usa stdout JSONL, stdin streaming o un SDK.
 
-`AgentEvent` è discriminated union: testo, thinking, tool call/result, command, file change, approval, usage, error e completed. Il renderer Telegram reagisce solo a questi eventi.
+Gli adapter CLI usano `ProcessRunner`, che riceve executable/argv/cwd/env/stdin e passa ad una spawn senza shell. L’environment del provider è costruito da una allowlist esplicita: `PATH`, discovery/config utente, locale/terminale e solo le variabili auth/config del provider; token Telegram, autorizzazione bot, database URL e altri secret applicativi non vengono ereditati. Gli argomenti persistiti sono validati dal provider e non diventano mai path costruiti o shell fragments.
+
+Su POSIX ogni provider è il leader di un process group dedicato (`detached` + segnali al PID negativo del gruppo): stop/errore inviano prima un segnale gentile e poi `SIGKILL` bounded, attendendo il reap. Su Windows il runtime usa il fallback del child PID; job objects/kill-tree nativi non sono ancora parte di M2 e richiedono un follow-up.
+
+`AgentEvent` è discriminated union: testo, thinking, tool call/result, command, file change, approval, usage, `session_identity`, error e completed. `session_identity` aggiorna la persistenza prima di continuare lo stream. `completed` e `error` sono terminali; EOF senza terminale è un protocol failure (`unknown`), mai un successo.
 
 `ChatGateway` supporta messaggi, edit, documenti, creazione e chiusura topic. La Bot API usa `message_thread_id`; non è presente nel dominio applicativo oltre agli adapter e alla chiave persistente.
 
@@ -43,13 +60,17 @@ Telegram update
   → Telegram adapter normalizza chatId/threadId/userId/text
   → TelegramTopic/BotSession lookup
   → AuthorizationService (chat + user ID + ruolo)
-  → SessionQueue serializza per BotSession
-  → Execution pending → running
+  → supervised task dispatch (polling non attende l’executor)
+  → SessionQueue serializza per BotSession; topic diversi possono procedere in parallelo
+  → reload authoritative BotSession dentro la coda
+  → Execution pending → starting/running
   → ExecutorRegistry seleziona adapter
-  → AgentExecutor.start/resume
-  → AgentExecutor.send → AgentEvent normalizzati
+  → AgentExecutor.start/resume con AbortSignal
+  → AgentExecutor.send → ProcessRunner.spawn senza shell
+  → AgentEvent normalizzati
+  → `session_identity` → persist native ID immediatamente
   → ThrottledEventRenderer aggiorna un solo messaggio
-  → Execution completed/failed/stopped + BotSession idle/failed/stopped
+  → terminal event/abort/EOF → Execution completed/failed/stopped/unknown + BotSession idle/failed/stopped
   → audit + persistence
 ```
 
@@ -57,31 +78,25 @@ Una seconda richiesta nello stesso topic aspetta la prima; topic diversi non con
 
 ## Capability reali verificate
 
-Versioni presenti sulla macchina durante la ricognizione: `codex-cli 0.155.1`, `Claude Code 2.1.278`, `Bun 1.4.2`.
+Versioni verificate durante M2: `codex-cli 0.155.1`, `Claude Code 2.1.280`, `Bun 1.4.2`.
 
-Codex espone `codex exec --json` con eventi JSONL, `exec resume --last` o un session ID, `--cd`, `--model`, `--sandbox`, `--image`, `--worktree`, `--output-last-message` e segnali di processo. Il requisito di repository Git e la semantica sandbox/approval devono restare responsabilità dell’adapter. La documentazione ufficiale descrive anche `--output-schema` e la persistenza degli ID thread.
+| Aspetto  | Codex                                        | Claude Code                                                                                    |
+| -------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| fresh    | `codex exec --json ... -`; prompt su stdin   | `claude -p --output-format stream-json --input-format stream-json`; user message JSON su stdin |
+| identity | `thread.started.thread_id`                   | `system` + `subtype=init` + `session_id`                                                       |
+| resume   | `codex exec resume <native-id> --json ... -` | `claude -p ... --resume <native-id>`                                                           |
+| terminal | `turn.completed`, exit code                  | `result` success/error, exit code                                                              |
 
-Claude Code espone `claude -p --output-format stream-json`, input `stream-json`, `--resume`, `--continue`, `--model`, `--permission-mode`, `--permission-prompts`, `--include-partial-messages` e `--session-id`. Il flusso interattivo permission prompt non va emulato in base a testo umano: l’adapter dovrà usare il canale strutturato previsto dalla CLI/SDK.
+Gli adapter validano gli eventi richiesti, tollerano campi aggiuntivi e trasformano output sconosciuto/malformed in provider protocol errors. L’identity è emessa appena disponibile; l’application layer confronta l’ID con quello persistito, audita `execution.session_identity_conflict` una sola volta e non sostituisce l’ID salvato. Gli eventuali `agent_session_id` pre-M2 sono conservati come `legacyRuntimeSessionId` non resumable, mai trattati come native Codex/Claude ID.
 
-Differenze sostanziali:
+Le permission prompt interattive non vengono ricostruite da testo umano: Claude usa `--permission-prompts none` in questa slice e le capability approvals restano false.
 
-| Aspetto         | Codex                         | Claude Code                               |
-| --------------- | ----------------------------- | ----------------------------------------- |
-| non-interactive | `codex exec`                  | `claude -p`                               |
-| eventi          | JSONL su stdout con `--json`  | `stream-json` su stdout                   |
-| resume          | `exec resume <id>` / `--last` | `--resume <id>` / `--continue`            |
-| sandbox         | `--sandbox` e approval CLI    | permission mode/prompt host               |
-| immagini        | `--image`                     | file/input secondo CLI/SDK                |
-| worktree        | flag nativa `--worktree`      | worktree support da valutare nell’adapter |
+## Recovery, `/session` e cancellation
 
-Queste differenze sono isolate in M2/M3; non entrano in `AgentEvent` oltre alle capability dichiarate.
+Dopo restart, `BotSession.executorSessionId` ricarica `ExecutorSession.nativeSessionId`; se l’ID esiste ma resume non è supportato, l’execution fallisce chiusa e l’adapter non avvia una sessione nuova. `/session` mostra topic Telegram, runtime ID se attivo, executor, native ID, stato, execution attiva e supporto resume; non mostra environment, token, raw argv o path sensibili.
 
-## Recovery e cancellation
-
-Durante il bootstrap, execution `running` senza processo riconciliabile deve diventare `unknown`/`interrupted` secondo una policy esplicita, non `completed`. Se l’executor conserva un native session ID, `/restart` può invocare `resume`; altrimenti si crea una nuova `AgentSession` e si informa l’utente.
-
-`/stop` cancella l’`AbortController`, invia `interrupt` al provider e persiste `stopped`. Il processo adapter deve poi inviare il signal OS corretto e attendere l’exit; il core non interpreta l’assenza di output come successo.
+`/stop` stabilisce l’autorità di cancellazione prima di `start`/`resume`, passa il signal a start/resume/send, invia `interrupt` quando esiste un runtime handle e persiste `stopped`. `ProcessRunner` chiede graceful termination, poi forza `SIGKILL` dopo una grace period iniettata. L’EOF osservato dopo abort resta `stopped`; EOF senza terminale resta `unknown`. `/close` è serializzato e rifiuta un execution attivo.
 
 ## Deferred
 
-Approval inline, attachment storage, real Codex/Claude adapters, worktree lifecycle, webhook Telegram, PostgreSQL/Supabase e recovery dei PID sono deliberatamente fuori da questa PR.
+Approval inline, attachment storage, worktree lifecycle, webhook Telegram e reconciliation di rename/close/delete dei topic, PostgreSQL/Supabase, recovery dei PID e Redis/BullMQ sono fuori da M2. Il polling corrente normalizza solo messaggi testuali.

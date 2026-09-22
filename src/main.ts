@@ -5,7 +5,7 @@ import {
   AuthorizationService,
   InMemoryExecutorRegistry,
 } from "./application.js";
-import { FakeAgentExecutor } from "./adapters.js";
+import { ClaudeCodeExecutor, CodexCliExecutor } from "./provider-adapters.js";
 import { parseProjects, parseUsers } from "./config.js";
 import { SqlitePersistence } from "./sqlite.js";
 import { TelegramApiGateway, runTelegramPolling } from "./telegram.js";
@@ -37,7 +37,8 @@ await persistence.topics.save({
 
 const gateway = new TelegramApiGateway(token);
 const registry = new InMemoryExecutorRegistry();
-registry.register(new FakeAgentExecutor());
+registry.register(new CodexCliExecutor());
+registry.register(new ClaudeCodeExecutor());
 const orchestrator = new AgentOrchestrator(
   persistence,
   registry,
@@ -46,6 +47,11 @@ const orchestrator = new AgentOrchestrator(
 );
 
 const abort = new AbortController();
-process.once("SIGINT", () => abort.abort());
-process.once("SIGTERM", () => abort.abort());
+const shutdown = () => {
+  abort.abort();
+  void orchestrator.shutdown();
+};
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
 await runTelegramPolling(gateway, (message) => orchestrator.handleMessage(message), abort.signal);
+await orchestrator.shutdown();

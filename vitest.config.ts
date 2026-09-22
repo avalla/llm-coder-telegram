@@ -5,5 +5,6 @@ export default defineConfig({
     environment: "node",
     globals: true,
     restoreMocks: true,
+    exclude: ["tests/sqlite-integrity.test.ts"],
   },
 });

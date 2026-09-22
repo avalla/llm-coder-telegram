@@ -35,6 +35,64 @@ export interface ProviderProbe {
 
 type PendingCompletion = Extract<AgentEvent, { type: "completed" }>;
 
+const COMMON_PROVIDER_ENVIRONMENT = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TERM",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+] as const;
+
+const PROVIDER_ENVIRONMENT = {
+  codex: [
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_ORGANIZATION",
+    "CODEX_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+  ],
+  claude: [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+  ],
+} as const;
+
+export type ProviderId = keyof typeof PROVIDER_ENVIRONMENT;
+
+export function buildProviderEnvironment(
+  provider: ProviderId,
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const allowed = [...COMMON_PROVIDER_ENVIRONMENT, ...PROVIDER_ENVIRONMENT[provider]];
+  return Object.fromEntries(
+    allowed.flatMap((key) => {
+      const value = source[key];
+      return value === undefined ? [] : [[key, value]];
+    }),
+  );
+}
+
 abstract class ProcessExecutor implements AgentExecutor {
   abstract readonly id: string;
   abstract readonly name: string;
@@ -42,9 +100,15 @@ abstract class ProcessExecutor implements AgentExecutor {
   private readonly processes = new Map<string, ProcessHandle>();
 
   constructor(
+    providerId: ProviderId,
     private readonly runner: ProcessRunner,
     private readonly executable: string,
-  ) {}
+    environmentSource: NodeJS.ProcessEnv = process.env,
+  ) {
+    this.providerEnvironment = buildProviderEnvironment(providerId, environmentSource);
+  }
+
+  private readonly providerEnvironment: Record<string, string>;
 
   abstract capabilities(): ExecutorCapabilities;
   protected abstract buildArgs(session: AgentSession, input: AgentInput): readonly string[];
@@ -91,15 +155,29 @@ abstract class ProcessExecutor implements AgentExecutor {
     let handle: ProcessHandle | undefined;
     let sequence = 0;
     let pendingCompletion: PendingCompletion | undefined;
+    let observedNativeSession = false;
+    let processExited = false;
+    let processCleaned = false;
+    let removeAbortHandler: (() => void) | undefined;
     try {
       handle = await this.runner.spawn({
         executable: this.executable,
         args: this.buildArgs(session, input),
         cwd: session.workspacePath,
+        env: this.providerEnvironment,
         ...(input.signal ? { signal: input.signal } : {}),
       });
       this.processes.set(session.runtimeSessionId, handle);
-      await handle.writeStdin(this.promptPayload(input.prompt));
+      if (input.signal) {
+        const abortHandler = (): void => {
+          void handle?.signal("SIGTERM").catch(() => undefined);
+        };
+        input.signal.addEventListener("abort", abortHandler, { once: true });
+        removeAbortHandler = () => input.signal?.removeEventListener("abort", abortHandler);
+      }
+      if (input.signal?.aborted) return;
+      await handle.writeStdin(this.promptPayload(input.prompt), input.signal);
+      if (input.signal?.aborted) return;
       await handle.closeStdin();
 
       const stderr = collectStderr(handle.stderr);
@@ -109,9 +187,13 @@ abstract class ProcessExecutor implements AgentExecutor {
         for (const event of this.parseLine(parsed, session, ++sequence)) {
           if (event.type === "completed") {
             pendingCompletion = event;
+          } else if (event.type === "session_identity") {
+            observedNativeSession = true;
+            yield event;
           } else if (event.type === "error") {
             yield event;
-            await terminateQuietly(handle);
+            await terminateProcess(handle);
+            processCleaned = true;
             return;
           } else {
             yield event;
@@ -120,9 +202,10 @@ abstract class ProcessExecutor implements AgentExecutor {
       }
 
       const exit = await handle.wait();
+      processExited = true;
       await stderr;
       if (input.signal?.aborted) return;
-      if (!session.nativeSessionId) {
+      if (!session.nativeSessionId && !observedNativeSession) {
         throw new ProviderError(
           this.id,
           "protocol",
@@ -145,7 +228,10 @@ abstract class ProcessExecutor implements AgentExecutor {
       }
     } catch (error) {
       if (input.signal?.aborted) return;
-      if (handle) await terminateQuietly(handle);
+      if (handle && !processExited) {
+        await terminateProcess(handle);
+        processCleaned = true;
+      }
       yield {
         type: "error",
         message: providerErrorMessage(this.name, error),
@@ -154,7 +240,8 @@ abstract class ProcessExecutor implements AgentExecutor {
         sequence: ++sequence,
       };
     } finally {
-      if (handle) await handle.wait().catch(() => undefined);
+      removeAbortHandler?.();
+      if (handle && !processExited && !processCleaned) await terminateProcess(handle);
       this.processes.delete(session.runtimeSessionId);
     }
   }
@@ -175,6 +262,7 @@ abstract class ProcessExecutor implements AgentExecutor {
         executable: this.executable,
         args: this.versionArgs(),
         cwd: process.cwd(),
+        env: this.providerEnvironment,
       });
       const output = collectText(handle.stdout);
       await handle.closeStdin();
@@ -211,13 +299,19 @@ abstract class ProcessExecutor implements AgentExecutor {
 export interface CodexCliExecutorOptions {
   runner?: ProcessRunner;
   executable?: string;
+  environmentSource?: NodeJS.ProcessEnv;
 }
 
 export class CodexCliExecutor extends ProcessExecutor {
   readonly id = "codex";
   readonly name = "OpenAI Codex";
   constructor(options: CodexCliExecutorOptions = {}) {
-    super(options.runner ?? new NodeProcessRunner(), options.executable ?? "codex");
+    super(
+      "codex",
+      options.runner ?? new NodeProcessRunner(),
+      options.executable ?? "codex",
+      options.environmentSource,
+    );
   }
 
   capabilities(): ExecutorCapabilities {
@@ -266,9 +360,6 @@ export class CodexCliExecutor extends ProcessExecutor {
     if (value.type === "thread.started") {
       const nativeSessionId = requiredString(value.thread_id, "Codex thread ID");
       this.validateNativeSessionId(nativeSessionId);
-      ensureExpectedIdentity(session, nativeSessionId, this.id);
-      session.nativeSessionId = nativeSessionId;
-      session.resumable = true;
       return [{ type: "session_identity", nativeSessionId, resumable: true, timestamp, sequence }];
     }
     if (value.type === "turn.completed") {
@@ -318,6 +409,7 @@ export class CodexCliExecutor extends ProcessExecutor {
 export interface ClaudeCodeExecutorOptions {
   runner?: ProcessRunner;
   executable?: string;
+  environmentSource?: NodeJS.ProcessEnv;
 }
 
 export class ClaudeCodeExecutor extends ProcessExecutor {
@@ -325,7 +417,12 @@ export class ClaudeCodeExecutor extends ProcessExecutor {
   readonly name = "Anthropic Claude Code";
 
   constructor(options: ClaudeCodeExecutorOptions = {}) {
-    super(options.runner ?? new NodeProcessRunner(), options.executable ?? "claude");
+    super(
+      "claude",
+      options.runner ?? new NodeProcessRunner(),
+      options.executable ?? "claude",
+      options.environmentSource,
+    );
   }
 
   capabilities(): ExecutorCapabilities {
@@ -377,9 +474,6 @@ export class ClaudeCodeExecutor extends ProcessExecutor {
     if (value.type === "system" && value.subtype === "init") {
       const nativeSessionId = requiredString(value.session_id, "Claude session ID");
       this.validateNativeSessionId(nativeSessionId);
-      ensureExpectedIdentity(session, nativeSessionId, this.id);
-      session.nativeSessionId = nativeSessionId;
-      session.resumable = true;
       return [{ type: "session_identity", nativeSessionId, resumable: true, timestamp, sequence }];
     }
     if (value.type === "assistant") {
@@ -441,16 +535,6 @@ export class ClaudeCodeExecutor extends ProcessExecutor {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function ensureExpectedIdentity(session: AgentSession, observed: string, provider: string): void {
-  if (session.nativeSessionId && session.nativeSessionId !== observed) {
-    throw new ProviderError(
-      provider,
-      "protocol",
-      "Provider returned a different native session ID during resume.",
-    );
-  }
-}
-
 function requiredString(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new ProviderError("provider", "protocol", `${label} is missing from structured output.`);
@@ -500,9 +584,27 @@ async function collectText(stream: AsyncIterable<Uint8Array>): Promise<string> {
   return output + decoder.decode();
 }
 
-async function terminateQuietly(handle: ProcessHandle): Promise<void> {
+async function terminateProcess(handle: ProcessHandle, gracePeriodMs = 250): Promise<void> {
+  if (await waitForExit(handle, 0)) return;
   await handle.signal("SIGTERM").catch(() => undefined);
+  if (await waitForExit(handle, gracePeriodMs)) return;
+  await handle.signal("SIGKILL").catch(() => undefined);
   await handle.wait().catch(() => undefined);
+}
+
+async function waitForExit(handle: ProcessHandle, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    handle.wait().then(
+      () => true,
+      () => true,
+    ),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return result;
 }
 
 function providerErrorMessage(provider: string, error: unknown): string {

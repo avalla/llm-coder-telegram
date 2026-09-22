@@ -53,6 +53,7 @@ export interface ExecutorSession {
   executorId: string;
   projectId: string;
   workspacePath: string;
+  legacyRuntimeSessionId?: string;
   nativeSessionId?: string;
   hostId?: string;
   resumable: boolean;

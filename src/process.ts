@@ -17,7 +17,7 @@ export interface ProcessHandle {
   readonly pid?: number;
   readonly stdout: AsyncIterable<Uint8Array>;
   readonly stderr: AsyncIterable<Uint8Array>;
-  writeStdin(chunk: string | Uint8Array): Promise<void>;
+  writeStdin(chunk: string | Uint8Array, signal?: AbortSignal): Promise<void>;
   closeStdin(): Promise<void>;
   signal(signal: "SIGINT" | "SIGTERM" | "SIGKILL"): Promise<void>;
   wait(): Promise<ProcessExit>;
@@ -41,15 +41,21 @@ export class ProcessStartError extends Error {
 export interface NodeProcessRunnerOptions {
   gracePeriodMs?: number;
   spawnImpl?: typeof nodeSpawn;
+  killImpl?: (pid: number, signal: NodeJS.Signals) => void;
+  platform?: NodeJS.Platform;
 }
 
 export class NodeProcessRunner implements ProcessRunner {
   private readonly gracePeriodMs: number;
   private readonly spawnImpl: typeof nodeSpawn;
+  private readonly killImpl: (pid: number, signal: NodeJS.Signals) => void;
+  private readonly platform: NodeJS.Platform;
 
   constructor(options: NodeProcessRunnerOptions = {}) {
     this.gracePeriodMs = options.gracePeriodMs ?? 250;
     this.spawnImpl = options.spawnImpl ?? nodeSpawn;
+    this.killImpl = options.killImpl ?? ((pid, signal) => process.kill(pid, signal));
+    this.platform = options.platform ?? process.platform;
   }
 
   async spawn(spec: ProcessSpec): Promise<ProcessHandle> {
@@ -58,9 +64,10 @@ export class NodeProcessRunner implements ProcessRunner {
     try {
       child = this.spawnImpl(spec.executable, [...spec.args], {
         cwd: spec.cwd,
-        env: spec.env ? { ...spec.env } : process.env,
+        env: spec.env ? { ...spec.env } : {},
         stdio: ["pipe", "pipe", "pipe"],
         shell: false,
+        detached: this.platform !== "win32",
       });
     } catch {
       throw new ProcessStartError("spawn_failed");
@@ -86,12 +93,19 @@ export class NodeProcessRunner implements ProcessRunner {
     signal: AbortSignal | undefined,
   ): ProcessHandle {
     let terminated = false;
+    let exited = false;
     let forceTimer: ReturnType<typeof setTimeout> | undefined;
     const terminate = (terminationSignal: "SIGINT" | "SIGTERM" | "SIGKILL"): void => {
+      if (exited) return;
       if (terminated && terminationSignal !== "SIGKILL") return;
       if (terminationSignal !== "SIGKILL") terminated = true;
+      if (terminationSignal === "SIGKILL" && forceTimer) clearTimeout(forceTimer);
       try {
-        child.kill(terminationSignal);
+        if (this.platform !== "win32" && child.pid !== undefined) {
+          this.killImpl(-child.pid, terminationSignal);
+        } else {
+          child.kill(terminationSignal);
+        }
       } catch {
         return;
       }
@@ -106,23 +120,28 @@ export class NodeProcessRunner implements ProcessRunner {
       child.once("error", (cause: NodeJS.ErrnoException) => {
         reject(new ProcessStartError(cause.code === "ENOENT" ? "not_found" : "spawn_failed"));
       });
-      child.once("close", (code: number | null, childSignal: NodeJS.Signals | null) =>
-        resolve({ code, ...(childSignal ? { signal: childSignal } : {}) }),
-      );
+      child.once("close", (code: number | null, childSignal: NodeJS.Signals | null) => {
+        exited = true;
+        if (forceTimer) clearTimeout(forceTimer);
+        resolve({ code, ...(childSignal ? { signal: childSignal } : {}) });
+      });
     });
     const wait = async (): Promise<ProcessExit> => {
-      const exit = await exitPromise;
-      if (forceTimer) clearTimeout(forceTimer);
-      signal?.removeEventListener("abort", abortHandler);
-      return exit;
+      try {
+        return await exitPromise;
+      } finally {
+        if (forceTimer) clearTimeout(forceTimer);
+        signal?.removeEventListener("abort", abortHandler);
+      }
     };
 
     return {
       ...(child.pid === undefined ? {} : { pid: child.pid }),
       stdout: child.stdout,
       stderr: child.stderr,
-      writeStdin: async (chunk) => {
-        if (!child.stdin.write(chunk)) await onceDrain(child.stdin);
+      writeStdin: async (chunk, writeSignal) => {
+        if (writeSignal?.aborted) throw new Error("Process stdin write aborted.");
+        if (!child.stdin.write(chunk)) await onceDrain(child.stdin, writeSignal);
       },
       closeStdin: async () => {
         child.stdin.end();
@@ -133,8 +152,24 @@ export class NodeProcessRunner implements ProcessRunner {
   }
 }
 
-function onceDrain(stream: NodeJS.WritableStream): Promise<void> {
-  return new Promise((resolve) => stream.once("drain", resolve));
+function onceDrain(stream: NodeJS.WritableStream, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      stream.removeListener("drain", onDrain);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reject(new Error("Process stdin write aborted."));
+    };
+    const onDrain = (): void => {
+      cleanup();
+      resolve();
+    };
+    stream.once("drain", onDrain);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class FakeProcessRunner implements ProcessRunner {

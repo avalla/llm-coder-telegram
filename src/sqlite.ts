@@ -27,6 +27,7 @@ interface ExecutorSessionRow {
   project_id: string;
   workspace_path: string;
   host_id: string | null;
+  legacy_runtime_session_id: string | null;
   resumable: number;
   created_at: number;
   last_used_at: number;
@@ -103,124 +104,227 @@ export class SqlitePersistence implements Persistence {
 
 function migrate(db: Database): void {
   db.run("PRAGMA foreign_keys = ON");
-  db.run("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)");
+  db.run("BEGIN IMMEDIATE");
+  try {
+    db.run("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)");
+    const version =
+      db
+        .query<{ version: number }, any>(
+          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+        )
+        .get()?.version ?? 0;
 
-  const version =
-    db
-      .query<{ version: number }, any>(
-        "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-      )
-      .get()?.version ?? 0;
-
-  if (version < 1) {
-    db.run(`
-      CREATE TABLE IF NOT EXISTS projects (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        workspace_path TEXT NOT NULL CHECK (length(workspace_path) > 0),
-        allowed_executor_ids TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS executor_sessions (
-        id TEXT PRIMARY KEY,
-        executor_id TEXT NOT NULL,
-        native_session_id TEXT,
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        workspace_path TEXT NOT NULL CHECK (length(workspace_path) > 0),
-        host_id TEXT,
-        resumable INTEGER NOT NULL CHECK (resumable IN (0, 1) AND (resumable = 0 OR native_session_id IS NOT NULL)),
-        created_at INTEGER NOT NULL,
-        last_used_at INTEGER NOT NULL,
-        UNIQUE (executor_id, native_session_id)
-      );
-      CREATE TABLE IF NOT EXISTS bot_sessions (
-        id TEXT PRIMARY KEY,
-        telegram_chat_id TEXT NOT NULL,
-        telegram_thread_id TEXT NOT NULL,
-        executor_id TEXT NOT NULL,
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        workspace_path TEXT NOT NULL CHECK (length(workspace_path) > 0),
-        executor_session_id TEXT REFERENCES executor_sessions(id),
-        status TEXT NOT NULL CHECK (status IN ('idle', 'starting', 'running', 'awaiting_approval', 'failed', 'stopped', 'closed')),
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        UNIQUE (telegram_chat_id, telegram_thread_id)
-      );
-      CREATE TABLE IF NOT EXISTS executions (
-        id TEXT PRIMARY KEY,
-        bot_session_id TEXT NOT NULL REFERENCES bot_sessions(id),
-        requested_by_user_id TEXT NOT NULL,
-        prompt TEXT NOT NULL CHECK (length(prompt) > 0),
-        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'awaiting_approval', 'completed', 'failed', 'stopped', 'interrupted', 'unknown')),
-        correlation_id TEXT NOT NULL UNIQUE,
-        executor_session_id TEXT REFERENCES executor_sessions(id),
-        started_at INTEGER,
-        finished_at INTEGER,
-        error_message TEXT
-      );
-      CREATE TABLE IF NOT EXISTS telegram_topics (
-        chat_id TEXT NOT NULL,
-        thread_id TEXT NOT NULL,
-        session_id TEXT REFERENCES bot_sessions(id),
-        kind TEXT NOT NULL CHECK (kind IN ('control', 'workspace')),
-        title TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('open', 'closed', 'deleted')),
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY (chat_id, thread_id)
-      );
-      CREATE TABLE IF NOT EXISTS audit_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        action TEXT NOT NULL,
-        user_id TEXT,
-        chat_id TEXT,
-        session_id TEXT REFERENCES bot_sessions(id),
-        execution_id TEXT REFERENCES executions(id),
-        correlation_id TEXT NOT NULL,
-        metadata TEXT,
-        created_at INTEGER NOT NULL
-      );
-    `);
-    db.query("INSERT INTO schema_migrations (version) VALUES (?)").run(1);
-  }
-
-  const currentVersion =
-    db
-      .query<{ version: number }, any>(
-        "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-      )
-      .get()?.version ?? 0;
-  if (currentVersion < 2) {
-    db.run(`
-      CREATE TABLE IF NOT EXISTS executor_sessions (
-        id TEXT PRIMARY KEY,
-        executor_id TEXT NOT NULL,
-        native_session_id TEXT,
-        project_id TEXT NOT NULL,
-        workspace_path TEXT NOT NULL CHECK (length(workspace_path) > 0),
-        host_id TEXT,
-        resumable INTEGER NOT NULL DEFAULT 0 CHECK (resumable IN (0, 1)),
-        created_at INTEGER NOT NULL,
-        last_used_at INTEGER NOT NULL,
-        UNIQUE (executor_id, native_session_id)
-      );
-    `);
-    addColumnIfMissing(db, "bot_sessions", "executor_session_id", "TEXT");
-    addColumnIfMissing(db, "executions", "executor_session_id", "TEXT");
-    db.run(`
-      CREATE INDEX IF NOT EXISTS idx_bot_sessions_project ON bot_sessions(project_id);
-      CREATE INDEX IF NOT EXISTS idx_executions_session ON executions(bot_session_id);
-      CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
-      CREATE INDEX IF NOT EXISTS idx_executor_sessions_native ON executor_sessions(executor_id, native_session_id);
-      CREATE INDEX IF NOT EXISTS idx_topics_session ON telegram_topics(session_id);
-    `);
-    db.query("INSERT INTO schema_migrations (version) VALUES (?)").run(2);
+    if (!tableExists(db, "projects")) {
+      createCanonicalSchema(db);
+    } else if (version < 3) {
+      rebuildPreM2OrIncompleteSchema(db);
+    }
+    for (const completedVersion of [1, 2, 3]) {
+      if (version < completedVersion) {
+        db.query("INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)").run(
+          completedVersion,
+        );
+      }
+    }
+    db.run("COMMIT");
+  } catch (error) {
+    db.run("ROLLBACK");
+    throw error;
   }
 }
 
-function addColumnIfMissing(db: Database, table: string, column: string, definition: string): void {
-  const columns = db.query<{ name: string }, any>(`PRAGMA table_info(${table})`).all();
-  if (!columns.some((candidate) => candidate.name === column)) {
-    db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+function createCanonicalSchema(db: Database): void {
+  db.run(`
+    CREATE TABLE projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      workspace_path TEXT NOT NULL CHECK (length(workspace_path) > 0),
+      allowed_executor_ids TEXT NOT NULL
+    );
+    CREATE TABLE executor_sessions (
+      id TEXT PRIMARY KEY,
+      executor_id TEXT NOT NULL,
+      native_session_id TEXT CHECK (native_session_id IS NULL OR length(native_session_id) > 0),
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      workspace_path TEXT NOT NULL CHECK (length(workspace_path) > 0),
+      host_id TEXT,
+      legacy_runtime_session_id TEXT,
+      resumable INTEGER NOT NULL CHECK (resumable IN (0, 1) AND (resumable = 0 OR native_session_id IS NOT NULL)),
+      created_at INTEGER NOT NULL,
+      last_used_at INTEGER NOT NULL,
+      UNIQUE (executor_id, native_session_id)
+    );
+    CREATE TABLE bot_sessions (
+      id TEXT PRIMARY KEY,
+      telegram_chat_id TEXT NOT NULL,
+      telegram_thread_id TEXT NOT NULL,
+      executor_id TEXT NOT NULL,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      workspace_path TEXT NOT NULL CHECK (length(workspace_path) > 0),
+      executor_session_id TEXT REFERENCES executor_sessions(id),
+      status TEXT NOT NULL CHECK (status IN ('idle', 'starting', 'running', 'awaiting_approval', 'failed', 'stopped', 'closed')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE (telegram_chat_id, telegram_thread_id)
+    );
+    CREATE TABLE executions (
+      id TEXT PRIMARY KEY,
+      bot_session_id TEXT NOT NULL REFERENCES bot_sessions(id),
+      requested_by_user_id TEXT NOT NULL,
+      prompt TEXT NOT NULL CHECK (length(prompt) > 0),
+      status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'awaiting_approval', 'completed', 'failed', 'stopped', 'interrupted', 'unknown')),
+      correlation_id TEXT NOT NULL UNIQUE,
+      executor_session_id TEXT REFERENCES executor_sessions(id),
+      started_at INTEGER,
+      finished_at INTEGER,
+      error_message TEXT
+    );
+    CREATE TABLE telegram_topics (
+      chat_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      session_id TEXT REFERENCES bot_sessions(id),
+      kind TEXT NOT NULL CHECK (kind IN ('control', 'workspace')),
+      title TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('open', 'closed', 'deleted')),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (chat_id, thread_id)
+    );
+    CREATE TABLE audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT NOT NULL,
+      user_id TEXT,
+      chat_id TEXT,
+      session_id TEXT REFERENCES bot_sessions(id),
+      execution_id TEXT REFERENCES executions(id),
+      correlation_id TEXT NOT NULL,
+      metadata TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX idx_bot_sessions_project ON bot_sessions(project_id);
+    CREATE INDEX idx_executions_session ON executions(bot_session_id);
+    CREATE INDEX idx_executions_status ON executions(status);
+    CREATE INDEX idx_executor_sessions_native ON executor_sessions(executor_id, native_session_id);
+    CREATE INDEX idx_topics_session ON telegram_topics(session_id);
+  `);
+}
+
+function rebuildPreM2OrIncompleteSchema(db: Database): void {
+  for (const table of [
+    "audit_log",
+    "telegram_topics",
+    "executions",
+    "bot_sessions",
+    "executor_sessions",
+    "projects",
+  ]) {
+    if (tableExists(db, table)) db.run(`ALTER TABLE ${table} RENAME TO legacy_${table}`);
   }
+  const hasLegacyAgentId = columnExists(db, "legacy_bot_sessions", "agent_session_id");
+  const hasLegacyExecutionAgentId = columnExists(db, "legacy_executions", "agent_session_id");
+  createCanonicalSchema(db);
+
+  db.run(
+    "INSERT INTO projects SELECT id, name, workspace_path, allowed_executor_ids FROM legacy_projects",
+  );
+
+  if (!hasLegacyAgentId && tableExists(db, "legacy_executor_sessions")) {
+    const hasLegacyRuntimeId = columnExists(
+      db,
+      "legacy_executor_sessions",
+      "legacy_runtime_session_id",
+    );
+    db.run(`
+      INSERT INTO executor_sessions
+        (id, executor_id, native_session_id, project_id, workspace_path, host_id, legacy_runtime_session_id, resumable, created_at, last_used_at)
+      SELECT id, executor_id, native_session_id, project_id, workspace_path, host_id,
+        ${hasLegacyRuntimeId ? "legacy_runtime_session_id" : "NULL"},
+        CASE WHEN resumable = 1 AND native_session_id IS NOT NULL THEN 1 ELSE 0 END,
+        created_at, last_used_at
+      FROM legacy_executor_sessions
+    `);
+  }
+
+  if (hasLegacyAgentId) {
+    db.run(`
+      INSERT INTO executor_sessions
+        (id, executor_id, native_session_id, project_id, workspace_path, legacy_runtime_session_id, resumable, created_at, last_used_at)
+      SELECT 'legacy-runtime-' || id, executor_id, NULL, project_id, workspace_path, agent_session_id, 0, created_at, updated_at
+      FROM legacy_bot_sessions
+      WHERE agent_session_id IS NOT NULL
+    `);
+  }
+
+  const sessionExecutorId = hasLegacyAgentId
+    ? "CASE WHEN agent_session_id IS NULL THEN NULL ELSE 'legacy-runtime-' || id END"
+    : "executor_session_id";
+  db.run(`
+    INSERT INTO bot_sessions
+      (id, telegram_chat_id, telegram_thread_id, executor_id, project_id, workspace_path, executor_session_id, status, created_at, updated_at)
+    SELECT id, telegram_chat_id, telegram_thread_id, executor_id, project_id, workspace_path,
+      ${sessionExecutorId}, status, created_at, updated_at
+    FROM legacy_bot_sessions
+  `);
+
+  if (hasLegacyExecutionAgentId) {
+    db.run(`
+      INSERT INTO executor_sessions
+        (id, executor_id, native_session_id, project_id, workspace_path, legacy_runtime_session_id, resumable, created_at, last_used_at)
+      SELECT 'legacy-execution-' || e.id, s.executor_id, NULL, s.project_id, s.workspace_path, e.agent_session_id, 0,
+        COALESCE(e.started_at, s.created_at), COALESCE(e.finished_at, s.updated_at)
+      FROM legacy_executions e
+      JOIN legacy_bot_sessions s ON s.id = e.bot_session_id
+      WHERE e.agent_session_id IS NOT NULL
+    `);
+  }
+  const executionExecutorId = hasLegacyExecutionAgentId
+    ? "CASE WHEN agent_session_id IS NULL THEN NULL ELSE 'legacy-execution-' || id END"
+    : "executor_session_id";
+  db.run(`
+    INSERT INTO executions
+      (id, bot_session_id, requested_by_user_id, prompt, status, correlation_id, executor_session_id, started_at, finished_at, error_message)
+    SELECT id, bot_session_id, requested_by_user_id, prompt, status, correlation_id,
+      ${executionExecutorId}, started_at, finished_at, error_message
+    FROM legacy_executions
+  `);
+  db.run(`
+    INSERT INTO telegram_topics (chat_id, thread_id, session_id, kind, title, status, updated_at)
+    SELECT chat_id, thread_id, session_id, kind, title, status, updated_at FROM legacy_telegram_topics
+  `);
+  db.run(`
+    INSERT INTO audit_log (id, action, user_id, chat_id, session_id, execution_id, correlation_id, metadata, created_at)
+    SELECT id, action, user_id, chat_id, session_id, execution_id, correlation_id, metadata, created_at FROM legacy_audit_log
+  `);
+
+  for (const table of [
+    "audit_log",
+    "telegram_topics",
+    "executions",
+    "bot_sessions",
+    "executor_sessions",
+    "projects",
+  ]) {
+    if (tableExists(db, `legacy_${table}`)) db.run(`DROP TABLE legacy_${table}`);
+  }
+}
+
+function tableExists(db: Database, table: string): boolean {
+  return Boolean(
+    db
+      .query<{ name: string }, any>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(table),
+  );
+}
+
+function columnExists(db: Database, table: string, column: string): boolean {
+  return (
+    tableExists(db, table) &&
+    db
+      .query<{ name: string }, any>(`PRAGMA table_info(${table})`)
+      .all()
+      .some((item) => item.name === column)
+  );
 }
 
 class SqliteProjects implements ProjectRepository {
@@ -264,9 +368,9 @@ class SqliteExecutorSessions implements ExecutorSessionRepository {
   async save(session: ExecutorSession): Promise<void> {
     this.db
       .query(
-        `INSERT INTO executor_sessions (id, executor_id, native_session_id, project_id, workspace_path, host_id, resumable, created_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET executor_id=excluded.executor_id, native_session_id=excluded.native_session_id, project_id=excluded.project_id, workspace_path=excluded.workspace_path, host_id=excluded.host_id, resumable=excluded.resumable, last_used_at=excluded.last_used_at`,
+        `INSERT INTO executor_sessions (id, executor_id, native_session_id, project_id, workspace_path, host_id, legacy_runtime_session_id, resumable, created_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET executor_id=excluded.executor_id, native_session_id=excluded.native_session_id, project_id=excluded.project_id, workspace_path=excluded.workspace_path, host_id=excluded.host_id, legacy_runtime_session_id=excluded.legacy_runtime_session_id, resumable=excluded.resumable, last_used_at=excluded.last_used_at`,
       )
       .run(
         session.id,
@@ -275,6 +379,7 @@ class SqliteExecutorSessions implements ExecutorSessionRepository {
         session.projectId,
         session.workspacePath,
         session.hostId ?? null,
+        session.legacyRuntimeSessionId ?? null,
         session.resumable ? 1 : 0,
         session.createdAt.getTime(),
         session.lastUsedAt.getTime(),
@@ -288,6 +393,9 @@ function mapExecutorSession(row: ExecutorSessionRow): ExecutorSession {
     executorId: row.executor_id,
     projectId: row.project_id,
     workspacePath: row.workspace_path,
+    ...(row.legacy_runtime_session_id
+      ? { legacyRuntimeSessionId: row.legacy_runtime_session_id }
+      : {}),
     ...(row.native_session_id ? { nativeSessionId: row.native_session_id } : {}),
     ...(row.host_id ? { hostId: row.host_id } : {}),
     resumable: row.resumable === 1,

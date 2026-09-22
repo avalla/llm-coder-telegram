@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun run src/main.ts",
-    "test": "vitest run",
+    "test": "vitest run && bun test tests/sqlite-integrity.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "format:check": "prettier --check .",

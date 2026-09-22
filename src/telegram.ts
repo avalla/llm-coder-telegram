@@ -177,17 +177,50 @@ export class TelegramApiGateway implements ChatGateway {
   }
 }
 
+export class SupervisedTaskSet {
+  private readonly tasks = new Set<Promise<void>>();
+
+  constructor(
+    private readonly onError: (error: unknown) => void = (error) => console.error(error),
+  ) {}
+
+  spawn(task: Promise<void>): void {
+    const observed = task.then(
+      () => undefined,
+      (error) => {
+        this.onError(error);
+      },
+    );
+    this.tasks.add(observed);
+    void observed.then(() => this.tasks.delete(observed));
+  }
+
+  async drain(): Promise<void> {
+    while (this.tasks.size > 0) {
+      await Promise.all([...this.tasks]);
+    }
+  }
+}
+
 export async function runTelegramPolling(
   gateway: TelegramApiGateway,
   handler: (message: IncomingMessage) => Promise<void>,
   signal: AbortSignal,
+  tasks = new SupervisedTaskSet(),
 ): Promise<void> {
   let offset: number | undefined;
   while (!signal.aborted) {
-    const batch = await gateway.poll(offset, signal);
-    for (const message of batch.messages) {
-      await handler(message);
+    let batch;
+    try {
+      batch = await gateway.poll(offset, signal);
+    } catch (error) {
+      if (!signal.aborted) throw error;
+      break;
     }
     offset = batch.nextOffset ?? offset;
+    for (const message of batch.messages) {
+      tasks.spawn(Promise.resolve().then(() => handler(message)));
+    }
   }
+  await tasks.drain();
 }

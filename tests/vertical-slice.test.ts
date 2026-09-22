@@ -20,13 +20,14 @@ function fixture() {
   });
   const gateway = new InMemoryChatGateway();
   const registry = new InMemoryExecutorRegistry();
-  registry.register(new FakeAgentExecutor());
+  const executor = new FakeAgentExecutor();
+  registry.register(executor);
   const authorization = new AuthorizationService({
     allowedChatIds: ["chat-1"],
     users: { "owner-1": "owner", "operator-1": "operator", "viewer-1": "viewer" },
   });
   const orchestrator = new AgentOrchestrator(persistence, registry, gateway, authorization);
-  return { persistence, gateway, orchestrator };
+  return { persistence, gateway, executor, orchestrator };
 }
 
 describe("Telegram topic vertical slice", () => {

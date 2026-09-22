@@ -3,6 +3,7 @@ import {
   type AgentExecutor,
   type AgentSession,
   type AuditLog,
+  type ExecutorSession,
   type BotSession,
   type BotSessionRepository,
   type ChatGateway,
@@ -253,11 +254,43 @@ export interface CreateSessionRequest {
   title?: string;
 }
 
+export class ProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProtocolError";
+  }
+}
+
+export class NativeSessionIdentityConflictError extends ProtocolError {
+  constructor(
+    public readonly expectedNativeSessionId: string,
+    public readonly observedNativeSessionId: string,
+  ) {
+    super("Provider returned a conflicting native session identity.");
+    this.name = "NativeSessionIdentityConflictError";
+  }
+}
+
+type ActiveExecution = {
+  execution: Execution;
+  executor: AgentExecutor;
+  abort: AbortController;
+  agentSession?: AgentSession;
+  interrupted: boolean;
+  done: Promise<void>;
+  resolveDone: () => void;
+};
+
+type StreamResult =
+  | { status: "completed"; message: string }
+  | { status: "failed"; message: string }
+  | { status: "stopped"; message: string }
+  | { status: "unknown"; message: string };
+
 export class AgentOrchestrator {
-  private readonly active = new Map<
-    string,
-    { execution: Execution; session: AgentSession; abort: AbortController }
-  >();
+  private readonly active = new Map<string, ActiveExecution>();
+  private readonly runtimeSessions = new Map<string, AgentSession>();
+  private shuttingDown = false;
 
   constructor(
     private readonly persistence: Persistence,
@@ -316,7 +349,8 @@ export class AgentOrchestrator {
     }
 
     if (message.text.startsWith("/")) {
-      await this.handleSessionCommand(session, message);
+      const authoritative = (await this.persistence.sessions.getById(session.id)) ?? session;
+      await this.handleSessionCommand(authoritative, message);
       return;
     }
 
@@ -346,21 +380,37 @@ export class AgentOrchestrator {
     const active = this.active.get(sessionId);
     if (!active) return;
     active.abort.abort();
-    await this.executors
-      .require(
-        active.execution.agentSessionId ? active.session.executorId : active.session.executorId,
-      )
-      .interrupt(active.session);
+    await this.interruptActive(active);
     await this.audit("execution.stop_requested", userId, sessionId, active.execution.id, chatId);
   }
 
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    const active = [...this.active.values()];
+    await Promise.all(
+      active.map(async (execution) => {
+        execution.abort.abort();
+        await this.interruptActive(execution);
+      }),
+    );
+    await Promise.all(active.map((execution) => execution.done));
+  }
+
   private async handleSessionCommand(session: BotSession, message: IncomingMessage): Promise<void> {
-    this.authorization.authorize(message, message.text === "/status" ? "viewer" : "operator");
-    switch (message.text.trim()) {
+    const command = message.text.trim();
+    this.authorization.authorize(
+      message,
+      command === "/status" || command === "/session" || command === "/session info"
+        ? "viewer"
+        : "operator",
+    );
+    switch (command) {
       case "/status":
+      case "/session":
+      case "/session info":
         await this.gateway.sendMessage(
           { chatId: session.telegramChatId, threadId: session.telegramThreadId },
-          await this.statusText(session),
+          await this.statusText((await this.persistence.sessions.getById(session.id)) ?? session),
         );
         return;
       case "/stop":
@@ -371,24 +421,36 @@ export class AgentOrchestrator {
         );
         return;
       case "/close":
-        await this.closeSession(session, message.userId);
+        try {
+          await this.closeSession(session, message.userId);
+        } catch (error) {
+          await this.gateway.sendMessage(
+            { chatId: session.telegramChatId, threadId: session.telegramThreadId },
+            `Cannot close session: ${errorMessage(error)}`,
+          );
+        }
         return;
       default:
         await this.gateway.sendMessage(
           { chatId: session.telegramChatId, threadId: session.telegramThreadId },
-          "Unknown command. Try /status, /stop or /close.",
+          "Unknown command. Try /status, /session, /stop or /close.",
         );
     }
   }
 
   private async runPrompt(session: BotSession, message: IncomingMessage): Promise<void> {
     await this.queue.run(session.id, async () => {
-      const executor = this.executors.require(session.executorId);
-      const project = await this.requireProject(session.projectId);
+      if (this.shuttingDown) throw new Error("Orchestrator is shutting down");
+      const current = await this.persistence.sessions.getById(session.id);
+      if (!current) throw new Error(`Unknown session: ${session.id}`);
+      if (current.status === "closed") throw new Error("Session is closed");
+
+      const executor = this.executors.require(current.executorId);
+      const project = await this.requireProject(current.projectId);
       const correlationId = crypto.randomUUID();
       const execution: Execution = {
         id: crypto.randomUUID(),
-        botSessionId: session.id,
+        botSessionId: current.id,
         requestedByUserId: message.userId,
         prompt: message.text,
         status: "pending",
@@ -398,134 +460,349 @@ export class AgentOrchestrator {
       await this.audit(
         "execution.created",
         message.userId,
-        session.id,
+        current.id,
         execution.id,
         message.chatId,
         correlationId,
       );
 
-      const updatedSession = {
-        ...session,
-        status: "starting" as const,
-        updatedAt: this.clock.now(),
-      };
-      await this.persistence.sessions.save(updatedSession);
-      const agentSession =
-        session.agentSessionId && executor.resume
-          ? await executor.resume({
-              externalSessionId: session.agentSessionId,
-              projectId: project.id,
-              workspacePath: project.workspacePath,
-            })
-          : await executor.start({ projectId: project.id, workspacePath: project.workspacePath });
-
       const abort = new AbortController();
-      const active = {
-        execution: {
-          ...execution,
-          status: "running" as const,
-          startedAt: this.clock.now(),
-          agentSessionId: agentSession.id,
-        },
-        session: agentSession,
+      let resolveDone!: () => void;
+      const done = new Promise<void>((resolve) => {
+        resolveDone = resolve;
+      });
+      const active: ActiveExecution = {
+        execution,
+        executor,
         abort,
+        interrupted: false,
+        done,
+        resolveDone,
       };
-      this.active.set(session.id, active);
+      this.active.set(current.id, active);
+
+      let executorSession = current.executorSessionId
+        ? await this.persistence.executorSessions.getById(current.executorSessionId)
+        : undefined;
+      if (!executorSession) {
+        const now = this.clock.now();
+        executorSession = {
+          id: current.executorSessionId ?? crypto.randomUUID(),
+          executorId: executor.id,
+          projectId: project.id,
+          workspacePath: project.workspacePath,
+          resumable: false,
+          createdAt: now,
+          lastUsedAt: now,
+        };
+        await this.persistence.executorSessions.save(executorSession);
+      }
+      const executorSessionId = executorSession.id;
       await this.persistence.sessions.save({
-        ...updatedSession,
-        status: "running",
-        agentSessionId: agentSession.externalSessionId ?? agentSession.id,
+        ...current,
+        executorSessionId: executorSession.id,
+        status: "starting",
         updatedAt: this.clock.now(),
       });
-      await this.persistence.executions.save(active.execution);
 
-      const renderer = new ThrottledEventRenderer(this.gateway, {
-        chatId: session.telegramChatId,
-        threadId: session.telegramThreadId,
-      });
-      await renderer.start(executor.name, project);
-      try {
-        for await (const event of executor.send(agentSession, {
-          prompt: message.text,
-          signal: abort.signal,
-        })) {
-          if (event.type === "approval_request") {
-            await this.persistence.executions.save({
-              ...active.execution,
-              status: "awaiting_approval",
-            });
-            await this.persistence.sessions.save({
-              ...updatedSession,
-              status: "awaiting_approval",
-              agentSessionId: agentSession.externalSessionId ?? agentSession.id,
-              updatedAt: this.clock.now(),
-            });
-          }
-          await renderer.handle(event);
+      let renderer: ThrottledEventRenderer | undefined;
+      let finalized = false;
+      const finish = async (result: StreamResult): Promise<void> => {
+        if (finalized) return;
+        finalized = true;
+        const finishedAt = this.clock.now();
+        const finalStatus =
+          active.abort.signal.aborted && result.status === "completed"
+            ? { status: "stopped" as const, message: "Execution stopped." }
+            : result;
+        const finalExecution: Execution = {
+          ...active.execution,
+          status: finalStatus.status,
+          finishedAt,
+          ...(finalStatus.status === "completed" ? {} : { errorMessage: finalStatus.message }),
+        };
+        active.execution = finalExecution;
+        await this.persistence.executions.save(finalExecution);
+        const latest = await this.persistence.sessions.getById(current.id);
+        const sessionStatus =
+          latest?.status === "closed"
+            ? "closed"
+            : finalStatus.status === "completed"
+              ? "idle"
+              : finalStatus.status === "stopped"
+                ? "stopped"
+                : "failed";
+        await this.persistence.sessions.save({
+          ...(latest ?? current),
+          executorSessionId,
+          status: sessionStatus,
+          updatedAt: finishedAt,
+        });
+        if (renderer) {
+          await renderer.complete(
+            finalStatus.status === "completed"
+              ? "Completed"
+              : finalStatus.status === "stopped"
+                ? "Stopped"
+                : "Failed",
+            finalStatus.message,
+          );
         }
-        await this.persistence.executions.save({
+      };
+
+      try {
+        const hasNativeSession = Boolean(executorSession.nativeSessionId);
+        let agentSession: AgentSession;
+        if (hasNativeSession) {
+          if (!executorSession.resumable || !executor.capabilities().resume || !executor.resume) {
+            throw new ProtocolError("Executor cannot safely resume the persisted native session.");
+          }
+          const nativeSessionId = executorSession.nativeSessionId!;
+          const resumed = await executor.resume({
+            nativeSessionId,
+            projectId: project.id,
+            workspacePath: project.workspacePath,
+            signal: abort.signal,
+          });
+          if (resumed.nativeSessionId && resumed.nativeSessionId !== nativeSessionId) {
+            throw new ProtocolError("Executor returned a different native session during resume.");
+          }
+          agentSession = {
+            ...resumed,
+            nativeSessionId,
+            resumable: true,
+          };
+        } else {
+          agentSession = await executor.start({
+            projectId: project.id,
+            workspacePath: project.workspacePath,
+            signal: abort.signal,
+          });
+        }
+        active.agentSession = agentSession;
+        this.runtimeSessions.set(current.id, agentSession);
+        await this.interruptIfAborted(active);
+        executorSession = { ...executorSession, lastUsedAt: this.clock.now() };
+        await this.persistence.executorSessions.save(executorSession);
+
+        if (agentSession.nativeSessionId) {
+          executorSession = await this.persistNativeIdentity(
+            current.id,
+            executorSession,
+            agentSession.nativeSessionId,
+            agentSession.resumable ?? true,
+          );
+        }
+
+        active.execution = {
           ...active.execution,
-          status: "completed",
-          finishedAt: this.clock.now(),
-        });
+          status: "running",
+          startedAt: this.clock.now(),
+          executorSessionId: executorSession.id,
+        };
+        await this.persistence.executions.save(active.execution);
         await this.persistence.sessions.save({
-          ...updatedSession,
-          status: "idle",
-          agentSessionId: agentSession.externalSessionId ?? agentSession.id,
+          ...((await this.persistence.sessions.getById(current.id)) ?? current),
+          executorSessionId: executorSession.id,
+          status: "running",
           updatedAt: this.clock.now(),
         });
-        await renderer.complete("Completed", "Execution finished.");
+
+        renderer = new ThrottledEventRenderer(this.gateway, {
+          chatId: current.telegramChatId,
+          threadId: current.telegramThreadId,
+        });
+        await renderer.start(executor.name, project);
+
+        const result = await this.consumeStream(
+          current.id,
+          executorSession,
+          agentSession,
+          active,
+          renderer,
+          message.text,
+        );
+        await finish(result);
       } catch (error) {
-        const stopped = abort.signal.aborted;
-        await this.persistence.executions.save({
-          ...active.execution,
-          status: stopped ? "stopped" : "failed",
-          finishedAt: this.clock.now(),
-          errorMessage: errorMessage(error),
-        });
-        await this.persistence.sessions.save({
-          ...updatedSession,
-          status: stopped ? "stopped" : "failed",
-          agentSessionId: agentSession.externalSessionId ?? agentSession.id,
-          updatedAt: this.clock.now(),
-        });
-        await renderer.complete(
-          stopped ? "Stopped" : "Failed",
-          stopped ? "Execution stopped." : `Execution failed: ${errorMessage(error)}`,
+        if (error instanceof NativeSessionIdentityConflictError) {
+          await this.audit(
+            "execution.session_identity_conflict",
+            message.userId,
+            current.id,
+            execution.id,
+            message.chatId,
+            correlationId,
+          );
+        }
+        await finish(
+          abort.signal.aborted
+            ? { status: "stopped", message: "Execution stopped." }
+            : { status: "failed", message: `Execution failed: ${errorMessage(error)}` },
         );
       } finally {
-        this.active.delete(session.id);
+        this.active.delete(current.id);
+        active.resolveDone();
       }
     });
   }
 
+  private async consumeStream(
+    botSessionId: string,
+    executorSession: ExecutorSession,
+    agentSession: AgentSession,
+    active: ActiveExecution,
+    renderer: ThrottledEventRenderer,
+    prompt: string,
+  ): Promise<StreamResult> {
+    let terminal: StreamResult | undefined;
+    for await (const event of active.executor.send(agentSession, {
+      prompt,
+      signal: active.abort.signal,
+    })) {
+      if (active.abort.signal.aborted) return { status: "stopped", message: "Execution stopped." };
+      if (terminal) throw new ProtocolError("Executor emitted events after a terminal event");
+      if (event.type === "session_identity") {
+        executorSession = await this.persistNativeIdentity(
+          botSessionId,
+          executorSession,
+          event.nativeSessionId,
+          event.resumable,
+        );
+        active.agentSession = { ...agentSession, nativeSessionId: event.nativeSessionId };
+        agentSession = active.agentSession;
+      }
+      if (event.type === "approval_request") {
+        active.execution = { ...active.execution, status: "awaiting_approval" };
+        await this.persistence.executions.save(active.execution);
+        const current = await this.persistence.sessions.getById(botSessionId);
+        if (current && current.status !== "closed") {
+          await this.persistence.sessions.save({
+            ...current,
+            executorSessionId: executorSession.id,
+            status: "awaiting_approval",
+            updatedAt: this.clock.now(),
+          });
+        }
+      }
+      await renderer.handle(event);
+      if (event.type === "error") {
+        terminal = { status: "failed", message: event.message };
+      } else if (event.type === "completed") {
+        terminal =
+          event.exitCode !== undefined && event.exitCode !== 0
+            ? { status: "failed", message: `Provider exited with code ${event.exitCode}.` }
+            : { status: "completed", message: event.summary ?? "Execution finished." };
+      }
+    }
+    if (active.abort.signal.aborted) return { status: "stopped", message: "Execution stopped." };
+    return (
+      terminal ?? {
+        status: "unknown",
+        message: "Executor stream ended without a terminal event.",
+      }
+    );
+  }
+
+  private async persistNativeIdentity(
+    botSessionId: string,
+    executorSession: ExecutorSession,
+    nativeSessionId: string,
+    resumable: boolean,
+  ): Promise<ExecutorSession> {
+    if (!nativeSessionId.trim())
+      throw new ProtocolError("Executor emitted an empty native session ID");
+    if (executorSession.nativeSessionId && executorSession.nativeSessionId !== nativeSessionId) {
+      throw new NativeSessionIdentityConflictError(
+        executorSession.nativeSessionId,
+        nativeSessionId,
+      );
+    }
+    const updated = {
+      ...executorSession,
+      nativeSessionId,
+      resumable: executorSession.resumable || resumable,
+      lastUsedAt: this.clock.now(),
+    };
+    await this.persistence.executorSessions.save(updated);
+    const session = await this.persistence.sessions.getById(botSessionId);
+    if (session && session.status !== "closed") {
+      await this.persistence.sessions.save({
+        ...session,
+        executorSessionId: executorSession.id,
+        updatedAt: this.clock.now(),
+      });
+    }
+    return updated;
+  }
+
+  private async interruptActive(active: ActiveExecution): Promise<void> {
+    if (!active.agentSession || active.interrupted || !active.executor.capabilities().interrupt)
+      return;
+    active.interrupted = true;
+    await active.executor.interrupt(active.agentSession);
+  }
+
+  private async interruptIfAborted(active: ActiveExecution): Promise<void> {
+    if (!active.abort.signal.aborted) return;
+    await this.interruptActive(active);
+    throw new Error("Execution stopped before provider stream started");
+  }
+
   private async closeSession(session: BotSession, userId: string): Promise<void> {
     this.authorization.authorize({ userId, chatId: session.telegramChatId }, "operator");
-    await this.persistence.sessions.save({
-      ...session,
-      status: "closed",
-      updatedAt: this.clock.now(),
-    });
-    await this.persistence.topics.save({
-      chatId: session.telegramChatId,
-      threadId: session.telegramThreadId,
-      sessionId: session.id,
-      kind: "workspace",
-      title: "",
-      status: "closed",
-      updatedAt: this.clock.now(),
-    });
-    await this.gateway.closeTopic({
-      chatId: session.telegramChatId,
-      threadId: session.telegramThreadId,
-      title: "",
+    if (this.active.has(session.id)) {
+      throw new Error("An execution is active; use /stop before closing the session.");
+    }
+    await this.queue.run(session.id, async () => {
+      const current = await this.persistence.sessions.getById(session.id);
+      if (!current || current.status === "closed") return;
+      if (this.active.has(session.id)) {
+        throw new Error("An execution is active; use /stop before closing the session.");
+      }
+      const runtimeSession = this.runtimeSessions.get(session.id);
+      if (runtimeSession) {
+        const executor = this.executors.require(current.executorId);
+        if (executor.capabilities().close) await executor.close(runtimeSession);
+        this.runtimeSessions.delete(session.id);
+      }
+      const now = this.clock.now();
+      await this.persistence.sessions.save({ ...current, status: "closed", updatedAt: now });
+      await this.persistence.topics.save({
+        chatId: current.telegramChatId,
+        threadId: current.telegramThreadId,
+        sessionId: current.id,
+        kind: "workspace",
+        title: "",
+        status: "closed",
+        updatedAt: now,
+      });
+      await this.gateway.closeTopic({
+        chatId: current.telegramChatId,
+        threadId: current.telegramThreadId,
+        title: "",
+      });
     });
   }
 
   private async statusText(session: BotSession): Promise<string> {
     const executions = await this.persistence.executions.listBySession(session.id);
     const last = executions.at(-1);
-    return `Status: ${session.status}\nExecutor: ${session.executorId}\nProject: ${session.projectId}\nLast execution: ${last?.status ?? "none"}`;
+    const executorSession = session.executorSessionId
+      ? await this.persistence.executorSessions.getById(session.executorSessionId)
+      : undefined;
+    const executor = this.executors.require(session.executorId);
+    const active = this.active.get(session.id);
+    const runtimeSession = this.runtimeSessions.get(session.id);
+    return [
+      `Telegram topic: ${session.telegramChatId}/${session.telegramThreadId}`,
+      `Runtime session: ${runtimeSession?.runtimeSessionId ?? "not active"}`,
+      `Executor: ${executor.name} (${executor.id})`,
+      `Native session: ${executorSession?.nativeSessionId ?? "not established"}`,
+      `Status: ${session.status}`,
+      `Active execution: ${active?.execution.status ?? "none"}`,
+      `Resume supported: ${executor.capabilities().resume ? "yes" : "no"}`,
+      `Last execution: ${last?.status ?? "none"}`,
+    ].join("\n");
   }
 
   private async requireProject(id: string): Promise<Project> {

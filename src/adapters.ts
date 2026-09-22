@@ -3,8 +3,13 @@ import {
   type AgentExecutor,
   type AgentInput,
   type AgentSession,
+  type ExecutorCapabilities,
   type BotSession,
   type BotSessionRepository,
+  type ExecutorSession,
+  type ExecutorSessionRepository,
+  type ResumeSessionOptions,
+  type StartSessionOptions,
   type ChatGateway,
   type Execution,
   type ExecutionRepository,
@@ -18,76 +23,153 @@ import {
   type ChatMessageOptions,
 } from "./domain.js";
 
+export interface FakeAgentExecutorOptions {
+  script?: readonly AgentEvent[];
+  startGate?: Promise<void>;
+  resumeGate?: Promise<void>;
+  startError?: string;
+  resumeError?: string;
+}
+
 export class FakeAgentExecutor implements AgentExecutor {
   readonly id = "fake";
   readonly name = "FakeAgent";
+  readonly starts: StartSessionOptions[] = [];
+  readonly resumes: ResumeSessionOptions[] = [];
+  readonly sends: Array<{ session: AgentSession; input: AgentInput }> = [];
+  readonly interrupts: AgentSession[] = [];
+  readonly closes: AgentSession[] = [];
   private counter = 0;
   private readonly sessions = new Map<string, AgentSession>();
+  private readonly knownNativeSessionIds = new Set<string>();
+  private readonly streamGates: Promise<void>[] = [];
+  private script: readonly AgentEvent[] | undefined;
+  private readonly startGate: Promise<void> | undefined;
+  private readonly resumeGate: Promise<void> | undefined;
+  private readonly startError: string | undefined;
+  private readonly resumeError: string | undefined;
 
-  constructor(private readonly script: readonly AgentEvent[] = defaultScript) {}
+  constructor(options: FakeAgentExecutorOptions = {}) {
+    this.script = options.script;
+    this.startGate = options.startGate;
+    this.resumeGate = options.resumeGate;
+    this.startError = options.startError;
+    this.resumeError = options.resumeError;
+  }
 
-  capabilities() {
+  queueStreamGate(gate: Promise<void>): void {
+    this.streamGates.push(gate);
+  }
+
+  setScript(script: readonly AgentEvent[]): void {
+    this.script = script;
+  }
+
+  capabilities(): ExecutorCapabilities {
     return {
       resume: true,
+      interrupt: true,
+      close: true,
+      sessionIdentity: true,
       streaming: true,
       approvals: true,
       models: true,
       fileAttachments: true,
       structuredOutput: true,
       worktrees: false,
-    } as const;
+    };
   }
 
-  async start(options: { projectId: string; workspacePath: string }): Promise<AgentSession> {
-    const session: AgentSession = {
-      id: `fake-session-${++this.counter}`,
-      executorId: this.id,
-      projectId: options.projectId,
-      workspacePath: options.workspacePath,
-      externalSessionId: `fake-external-${this.counter}`,
-      createdAt: new Date(),
-    };
-    this.sessions.set(session.id, session);
-    return session;
+  async start(options: StartSessionOptions): Promise<AgentSession> {
+    this.starts.push(options);
+    if (this.startError) throw new Error(this.startError);
+    if (this.startGate) await abortableWait(this.startGate, options.signal);
+    return this.createSession(options.projectId, options.workspacePath);
   }
 
   async *send(session: AgentSession, input: AgentInput): AsyncIterable<AgentEvent> {
-    if (!this.sessions.has(session.id)) throw new Error("Unknown fake session");
-    for (const event of this.script) {
+    if (!this.sessions.has(session.runtimeSessionId)) throw new Error("Unknown fake session");
+    this.sends.push({ session, input });
+    const gate = this.streamGates.shift();
+    if (gate) await abortableWait(gate, input.signal);
+
+    const events = this.script ?? [
+      {
+        type: "session_identity",
+        nativeSessionId: session.nativeSessionId ?? `fake-native-${session.runtimeSessionId}`,
+        resumable: true,
+        timestamp: new Date(0),
+        sequence: 1,
+      },
+      {
+        type: "text_delta",
+        text: "Inspecting workspace…",
+        timestamp: new Date(0),
+        sequence: 2,
+      },
+      {
+        type: "completed",
+        summary: "No changes required.",
+        exitCode: 0,
+        timestamp: new Date(0),
+        sequence: 3,
+      },
+    ];
+    for (const event of events) {
       if (input.signal?.aborted) throw new Error("aborted");
+      if (event.type === "session_identity") this.knownNativeSessionIds.add(event.nativeSessionId);
       yield event;
     }
   }
 
   async interrupt(session: AgentSession): Promise<void> {
-    if (!this.sessions.has(session.id)) throw new Error("Unknown fake session");
+    this.interrupts.push(session);
+    if (!this.sessions.has(session.runtimeSessionId)) throw new Error("Unknown fake session");
   }
 
   async close(session: AgentSession): Promise<void> {
-    this.sessions.delete(session.id);
+    this.closes.push(session);
+    this.sessions.delete(session.runtimeSessionId);
   }
 
-  async resume(options: {
-    externalSessionId: string;
-    projectId: string;
-    workspacePath: string;
-  }): Promise<AgentSession> {
-    return this.start(options);
+  async resume(options: ResumeSessionOptions): Promise<AgentSession> {
+    this.resumes.push(options);
+    if (this.resumeError) throw new Error(this.resumeError);
+    if (this.resumeGate) await abortableWait(this.resumeGate, options.signal);
+    if (!this.knownNativeSessionIds.has(options.nativeSessionId)) {
+      throw new Error(`Unknown fake native session: ${options.nativeSessionId}`);
+    }
+    return this.createSession(options.projectId, options.workspacePath, options.nativeSessionId);
+  }
+
+  private createSession(
+    projectId: string,
+    workspacePath: string,
+    nativeSessionId?: string,
+  ): AgentSession {
+    const session: AgentSession = {
+      runtimeSessionId: `fake-runtime-${++this.counter}`,
+      executorId: this.id,
+      projectId,
+      workspacePath,
+      ...(nativeSessionId ? { nativeSessionId } : {}),
+      createdAt: new Date(),
+    };
+    this.sessions.set(session.runtimeSessionId, session);
+    return session;
   }
 }
 
-const defaultScript: readonly AgentEvent[] = [
-  { type: "text_delta", text: "Inspecting workspace…", timestamp: new Date(0), sequence: 1 },
-  { type: "command", command: "bun test", timestamp: new Date(0), sequence: 2 },
-  { type: "text_delta", text: "Tests passed.", timestamp: new Date(0), sequence: 3 },
-  {
-    type: "completed",
-    summary: "No changes required.",
-    exitCode: 0,
-    timestamp: new Date(0),
-    sequence: 4,
-  },
-];
+async function abortableWait(gate: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return gate;
+  if (signal.aborted) throw new Error("aborted");
+  await Promise.race([
+    gate,
+    new Promise<never>((_, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }),
+  ]);
+}
 
 export class InMemoryChatGateway implements ChatGateway {
   readonly sent: Array<{
@@ -135,6 +217,7 @@ export class InMemoryPersistence implements Persistence {
   readonly projects = new InMemoryProjects();
   readonly sessions = new InMemorySessions();
   readonly executions = new InMemoryExecutions();
+  readonly executorSessions = new InMemoryExecutorSessions();
   readonly topics = new InMemoryTopics();
   readonly audit = new InMemoryAuditLog();
 }
@@ -180,6 +263,18 @@ class InMemoryExecutions implements ExecutionRepository {
   }
   async listBySession(sessionId: string): Promise<readonly Execution[]> {
     return [...this.values.values()].filter((execution) => execution.botSessionId === sessionId);
+  }
+}
+
+export class InMemoryExecutorSessions implements ExecutorSessionRepository {
+  private readonly values = new Map<string, ExecutorSession>();
+
+  async getById(id: string): Promise<ExecutorSession | undefined> {
+    return this.values.get(id);
+  }
+
+  async save(session: ExecutorSession): Promise<void> {
+    this.values.set(session.id, session);
   }
 }
 

@@ -22,7 +22,7 @@ test("fresh SQLite migration enables integrity constraints", () => {
     db
       .query<{ version: number }, any>("SELECT version FROM schema_migrations ORDER BY version")
       .all(),
-  ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+  ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
 
   expect(() =>
     db
@@ -112,6 +112,7 @@ function logicalSchema(db: Database): Record<string, unknown> {
     "executor_sessions",
     "bot_sessions",
     "executions",
+    "execution_jobs",
     "telegram_topics",
     "audit_log",
   ];
@@ -207,7 +208,7 @@ test("migrates the exact pre-M2 SQLite schema without losing runtime state", asy
       upgraded.db
         .query<{ version: number }, any>("SELECT version FROM schema_migrations ORDER BY version")
         .all(),
-    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
     expect(await upgraded.projects.getById("project")).toMatchObject({
       id: "project",
       workspacePath: "/workspace/project",

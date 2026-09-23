@@ -43,6 +43,7 @@ export class FakeAgentExecutor implements AgentExecutor {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly knownNativeSessionIds = new Set<string>();
   private readonly streamGates: Promise<void>[] = [];
+  private readonly streamGatesByPrompt = new Map<string, Promise<void>[]>();
   private script: readonly AgentEvent[] | undefined;
   private readonly startGate: Promise<void> | undefined;
   private readonly resumeGate: Promise<void> | undefined;
@@ -59,6 +60,12 @@ export class FakeAgentExecutor implements AgentExecutor {
 
   queueStreamGate(gate: Promise<void>): void {
     this.streamGates.push(gate);
+  }
+
+  queueStreamGateForPrompt(prompt: string, gate: Promise<void>): void {
+    const gates = this.streamGatesByPrompt.get(prompt) ?? [];
+    gates.push(gate);
+    this.streamGatesByPrompt.set(prompt, gates);
   }
 
   setScript(script: readonly AgentEvent[]): void {
@@ -90,7 +97,9 @@ export class FakeAgentExecutor implements AgentExecutor {
   async *send(session: AgentSession, input: AgentInput): AsyncIterable<AgentEvent> {
     if (!this.sessions.has(session.runtimeSessionId)) throw new Error("Unknown fake session");
     this.sends.push({ session, input });
-    const gate = this.streamGates.shift();
+    const promptGates = this.streamGatesByPrompt.get(input.prompt);
+    const gate = promptGates?.shift() ?? this.streamGates.shift();
+    if (promptGates?.length === 0) this.streamGatesByPrompt.delete(input.prompt);
     if (gate) await abortableWait(gate, input.signal);
 
     const events = this.script ?? [
@@ -215,9 +224,9 @@ export class InMemoryChatGateway implements ChatGateway {
 
 export class InMemoryPersistence implements Persistence {
   readonly projects = new InMemoryProjects();
-  readonly sessions = new InMemorySessions();
   readonly executions = new InMemoryExecutions();
-  readonly executorSessions = new InMemoryExecutorSessions();
+  readonly sessions = new InMemorySessions(this.executions);
+  readonly executorSessions = new InMemoryExecutorSessions(this.executions);
   readonly topics = new InMemoryTopics();
   readonly audit = new InMemoryAuditLog();
 }
@@ -237,6 +246,9 @@ class InMemoryProjects implements ProjectRepository {
 
 class InMemorySessions implements BotSessionRepository {
   private readonly values = new Map<string, BotSession>();
+
+  constructor(private readonly executions: InMemoryExecutions) {}
+
   async getById(id: string): Promise<BotSession | undefined> {
     return this.values.get(id);
   }
@@ -248,6 +260,29 @@ class InMemorySessions implements BotSessionRepository {
   async save(session: BotSession): Promise<void> {
     this.values.set(session.id, session);
   }
+
+  async updateOwned(
+    session: BotSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    const execution = await this.executions.getById(executionId);
+    if (
+      !execution ||
+      execution.botSessionId !== session.id ||
+      execution.ownerId !== ownerId ||
+      execution.ownerFence !== fence ||
+      !execution.leaseExpiresAt ||
+      execution.leaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    this.values.set(session.id, session);
+    return true;
+  }
+
   async list(): Promise<readonly BotSession[]> {
     return [...this.values.values()];
   }
@@ -255,19 +290,175 @@ class InMemorySessions implements BotSessionRepository {
 
 class InMemoryExecutions implements ExecutionRepository {
   private readonly values = new Map<string, Execution>();
+
   async getById(id: string): Promise<Execution | undefined> {
     return this.values.get(id);
   }
+
   async save(execution: Execution): Promise<void> {
     this.values.set(execution.id, execution);
   }
+
   async listBySession(sessionId: string): Promise<readonly Execution[]> {
     return [...this.values.values()].filter((execution) => execution.botSessionId === sessionId);
+  }
+
+  async claim(
+    executionId: string,
+    ownerId: string,
+    now: Date,
+    leaseDurationMs: number,
+  ): Promise<import("./domain.js").ExecutionLease | undefined> {
+    const execution = this.values.get(executionId);
+    if (!execution || execution.status !== "pending") return undefined;
+    const active = [...this.values.values()].some(
+      (candidate) =>
+        candidate.botSessionId === execution.botSessionId &&
+        candidate.id !== execution.id &&
+        (candidate.status === "running" || candidate.status === "awaiting_approval") &&
+        candidate.leaseExpiresAt !== undefined &&
+        candidate.leaseExpiresAt.getTime() > now.getTime(),
+    );
+    if (active) return undefined;
+    const fence = execution.ownerFence + 1;
+    const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs);
+    this.values.set(execution.id, {
+      ...execution,
+      status: "running",
+      ownerId,
+      ownerFence: fence,
+      leaseExpiresAt,
+      startedAt: execution.startedAt ?? now,
+    });
+    return {
+      executionId,
+      botSessionId: execution.botSessionId,
+      ownerId,
+      fence,
+      leaseExpiresAt,
+      recovered: false,
+    };
+  }
+
+  async renew(
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+    leaseDurationMs: number,
+  ): Promise<boolean> {
+    const execution = this.values.get(executionId);
+    if (
+      !execution ||
+      execution.ownerId !== ownerId ||
+      execution.ownerFence !== fence ||
+      (execution.status !== "running" && execution.status !== "awaiting_approval") ||
+      !execution.leaseExpiresAt ||
+      execution.leaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    this.values.set(execution.id, {
+      ...execution,
+      leaseExpiresAt: new Date(now.getTime() + leaseDurationMs),
+    });
+    return true;
+  }
+
+  async updateOwned(
+    execution: Execution,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    const current = this.values.get(execution.id);
+    if (
+      !current ||
+      current.ownerId !== ownerId ||
+      current.ownerFence !== fence ||
+      !current.leaseExpiresAt ||
+      current.leaseExpiresAt <= now
+    )
+      return false;
+    this.values.set(execution.id, {
+      ...execution,
+      ownerFence: fence,
+      ...(execution.status === "completed" ||
+      execution.status === "failed" ||
+      execution.status === "stopped" ||
+      execution.status === "interrupted" ||
+      execution.status === "unknown"
+        ? { ownerId: undefined, leaseExpiresAt: undefined }
+        : { ownerId, leaseExpiresAt: execution.leaseExpiresAt }),
+    });
+    return true;
+  }
+
+  async requestCancellation(
+    executionId: string,
+    requestedByUserId: string,
+    now: Date,
+  ): Promise<Execution | undefined> {
+    const execution = this.values.get(executionId);
+    if (
+      !execution ||
+      (execution.status !== "pending" &&
+        execution.status !== "running" &&
+        execution.status !== "awaiting_approval")
+    ) {
+      return execution;
+    }
+    const stopped = execution.status === "pending" && !execution.ownerId;
+    const updated = {
+      ...execution,
+      ...(stopped
+        ? {
+            status: "stopped" as const,
+            finishedAt: now,
+            errorMessage: "Execution stopped before start.",
+          }
+        : {}),
+      cancelRequestedAt: now,
+      cancelRequestedByUserId: requestedByUserId,
+    };
+    this.values.set(executionId, updated);
+    return updated;
+  }
+
+  async recoverAfterRestart(now: Date): Promise<readonly Execution[]> {
+    const recovered = [];
+    for (const execution of this.values.values()) {
+      if (execution.status === "running" || execution.status === "awaiting_approval") {
+        const updated: Execution = {
+          ...execution,
+          status: "unknown",
+          finishedAt: now,
+          errorMessage: "Execution owner was lost during restart; provider state was not guessed.",
+          ownerId: undefined,
+          leaseExpiresAt: undefined,
+        };
+        this.values.set(execution.id, updated);
+        recovered.push(updated);
+      }
+    }
+    const pending = [...this.values.values()].filter((execution) => execution.status === "pending");
+    for (const execution of pending) {
+      if (execution.ownerId || execution.leaseExpiresAt) {
+        this.values.set(execution.id, {
+          ...execution,
+          ownerId: undefined,
+          leaseExpiresAt: undefined,
+        });
+      }
+    }
+    return [...recovered, ...pending];
   }
 }
 
 export class InMemoryExecutorSessions implements ExecutorSessionRepository {
   private readonly values = new Map<string, ExecutorSession>();
+
+  constructor(private readonly executions: InMemoryExecutions) {}
 
   async getById(id: string): Promise<ExecutorSession | undefined> {
     return this.values.get(id);
@@ -275,6 +466,28 @@ export class InMemoryExecutorSessions implements ExecutorSessionRepository {
 
   async save(session: ExecutorSession): Promise<void> {
     this.values.set(session.id, session);
+  }
+
+  async updateOwned(
+    session: ExecutorSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    const execution = await this.executions.getById(executionId);
+    if (
+      !execution ||
+      (execution.executorSessionId && execution.executorSessionId !== session.id) ||
+      execution.ownerId !== ownerId ||
+      execution.ownerFence !== fence ||
+      !execution.leaseExpiresAt ||
+      execution.leaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    this.values.set(session.id, session);
+    return true;
   }
 }
 

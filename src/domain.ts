@@ -45,7 +45,40 @@ export interface Execution {
   executorSessionId?: string;
   startedAt?: Date;
   finishedAt?: Date;
-  errorMessage?: string;
+  errorMessage?: string | undefined;
+  ownerId?: string | undefined;
+  ownerFence: number;
+  leaseExpiresAt?: Date | undefined;
+  cancelRequestedAt?: Date | undefined;
+  cancelRequestedByUserId?: string | undefined;
+}
+
+export interface ExecutionJob {
+  executionId: string;
+}
+
+export type ExecutionJobDisposition =
+  { disposition: "ack" } | { disposition: "retry"; delayMs?: number };
+
+export type ExecutionJobHandler = (job: ExecutionJob) => Promise<ExecutionJobDisposition>;
+
+export interface ExecutionJobQueue {
+  enqueue(job: ExecutionJob): Promise<void>;
+  cancel(executionId: string): Promise<void>;
+}
+
+export interface ExecutionJobWorker {
+  start(handler: ExecutionJobHandler): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface ExecutionLease {
+  executionId: string;
+  botSessionId: string;
+  ownerId: string;
+  fence: number;
+  leaseExpiresAt: Date;
+  recovered?: boolean;
 }
 
 export interface ExecutorSession {
@@ -240,6 +273,13 @@ export interface BotSessionRepository {
   getById(id: string): Promise<BotSession | undefined>;
   getByTopic(chatId: string, threadId: string): Promise<BotSession | undefined>;
   save(session: BotSession): Promise<void>;
+  updateOwned(
+    session: BotSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean>;
   list(): Promise<readonly BotSession[]>;
 }
 
@@ -247,11 +287,38 @@ export interface ExecutionRepository {
   getById(id: string): Promise<Execution | undefined>;
   save(execution: Execution): Promise<void>;
   listBySession(sessionId: string): Promise<readonly Execution[]>;
+  claim(
+    executionId: string,
+    ownerId: string,
+    now: Date,
+    leaseDurationMs: number,
+  ): Promise<ExecutionLease | undefined>;
+  renew(
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+    leaseDurationMs: number,
+  ): Promise<boolean>;
+  updateOwned(execution: Execution, ownerId: string, fence: number, now: Date): Promise<boolean>;
+  requestCancellation(
+    executionId: string,
+    requestedByUserId: string,
+    now: Date,
+  ): Promise<Execution | undefined>;
+  recoverAfterRestart(now: Date): Promise<readonly Execution[]>;
 }
 
 export interface ExecutorSessionRepository {
   getById(id: string): Promise<ExecutorSession | undefined>;
   save(session: ExecutorSession): Promise<void>;
+  updateOwned(
+    session: ExecutorSession,
+    executionId: string,
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean>;
 }
 
 export interface TelegramTopicRepository {

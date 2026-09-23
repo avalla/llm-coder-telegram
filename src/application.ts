@@ -8,7 +8,12 @@ import {
   type BotSessionRepository,
   type ChatGateway,
   type Execution,
+  type ExecutionJob,
+  type ExecutionJobDisposition,
+  type ExecutionJobQueue,
+  type ExecutionJobWorker,
   type ExecutionRepository,
+  type ExecutionLease,
   type ExecutorCapabilities,
   type IncomingMessage,
   type MessageRef,
@@ -275,11 +280,23 @@ type ActiveExecution = {
   execution: Execution;
   executor: AgentExecutor;
   abort: AbortController;
+  lease: ExecutionLease;
   agentSession?: AgentSession;
   interrupted: boolean;
+  ownershipLost: boolean;
   done: Promise<void>;
   resolveDone: () => void;
 };
+
+class StaleExecutionOwnershipError extends Error {
+  constructor() {
+    super("Execution ownership was lost.");
+    this.name = "StaleExecutionOwnershipError";
+  }
+}
+
+const EXECUTION_LEASE_MS = 30_000;
+const CANCELLATION_POLL_MS = 100;
 
 type StreamResult =
   | { status: "completed"; message: string }
@@ -290,7 +307,10 @@ type StreamResult =
 export class AgentOrchestrator {
   private readonly active = new Map<string, ActiveExecution>();
   private readonly runtimeSessions = new Map<string, AgentSession>();
+  private readonly workerId = `orchestrator-${crypto.randomUUID()}`;
   private shuttingDown = false;
+  private started = false;
+  private shutdownPromise?: Promise<void>;
 
   constructor(
     private readonly persistence: Persistence,
@@ -299,7 +319,41 @@ export class AgentOrchestrator {
     private readonly authorization: AuthorizationService,
     private readonly queue = new SessionQueue(),
     private readonly clock: Clock = systemClock,
+    private readonly jobQueue?: ExecutionJobQueue,
+    private readonly jobWorker?: ExecutionJobWorker,
   ) {}
+
+  async start(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+    const recovered = await this.persistence.executions.recoverAfterRestart(this.clock.now());
+    for (const execution of recovered) {
+      if (execution.status === "unknown") {
+        const session = await this.persistence.sessions.getById(execution.botSessionId);
+        if (session && session.status !== "closed") {
+          await this.persistence.sessions.save({
+            ...session,
+            status: "failed",
+            updatedAt: this.clock.now(),
+          });
+        }
+        await this.audit(
+          "execution.recovered_unknown",
+          execution.requestedByUserId,
+          execution.botSessionId,
+          execution.id,
+          undefined,
+          execution.correlationId,
+        );
+      } else if (execution.status === "pending") {
+        if (!this.jobQueue) {
+          throw new Error("Durable execution recovery requires an execution job queue.");
+        }
+        await this.jobQueue.enqueue({ executionId: execution.id });
+      }
+    }
+    if (this.jobWorker) await this.jobWorker.start((job) => this.processJob(job));
+  }
 
   async createSession(request: CreateSessionRequest): Promise<BotSession> {
     this.authorization.authorize(request, "operator");
@@ -377,23 +431,52 @@ export class AgentOrchestrator {
 
   async stop(sessionId: string, userId: string, chatId: string): Promise<void> {
     this.authorization.authorize({ userId, chatId }, "operator");
+    const executions = await this.persistence.executions.listBySession(sessionId);
+    const target = [...executions]
+      .reverse()
+      .find(
+        (execution) =>
+          execution.status === "pending" ||
+          execution.status === "running" ||
+          execution.status === "awaiting_approval",
+      );
+    if (!target) return;
+    const requested = await this.persistence.executions.requestCancellation(
+      target.id,
+      userId,
+      this.clock.now(),
+    );
+    await this.jobQueue?.cancel(target.id);
     const active = this.active.get(sessionId);
-    if (!active) return;
-    active.abort.abort();
-    await this.interruptActive(active);
-    await this.audit("execution.stop_requested", userId, sessionId, active.execution.id, chatId);
+    if (active && active.execution.id === target.id) {
+      active.abort.abort();
+      await this.interruptActive(active);
+    }
+    await this.audit(
+      "execution.stop_requested",
+      userId,
+      sessionId,
+      target.id,
+      chatId,
+      requested?.correlationId,
+    );
   }
 
   async shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
     this.shuttingDown = true;
-    const active = [...this.active.values()];
-    await Promise.all(
-      active.map(async (execution) => {
-        execution.abort.abort();
-        await this.interruptActive(execution);
-      }),
-    );
-    await Promise.all(active.map((execution) => execution.done));
+    this.shutdownPromise = (async () => {
+      const active = [...this.active.values()];
+      await Promise.all(
+        active.map(async (execution) => {
+          execution.abort.abort();
+          await this.interruptActive(execution);
+        }),
+      );
+      await Promise.all(active.map((execution) => execution.done));
+      await this.jobWorker?.close();
+    })();
+    return this.shutdownPromise;
   }
 
   private async handleSessionCommand(session: BotSession, message: IncomingMessage): Promise<void> {
@@ -439,51 +522,109 @@ export class AgentOrchestrator {
   }
 
   private async runPrompt(session: BotSession, message: IncomingMessage): Promise<void> {
-    await this.queue.run(session.id, async () => {
-      if (this.shuttingDown) throw new Error("Orchestrator is shutting down");
-      const current = await this.persistence.sessions.getById(session.id);
-      if (!current) throw new Error(`Unknown session: ${session.id}`);
-      if (current.status === "closed") throw new Error("Session is closed");
+    if (this.shuttingDown) throw new Error("Orchestrator is shutting down");
+    const current = await this.persistence.sessions.getById(session.id);
+    if (!current) throw new Error(`Unknown session: ${session.id}`);
+    if (current.status === "closed") throw new Error("Session is closed");
 
-      const executor = this.executors.require(current.executorId);
-      const project = await this.requireProject(current.projectId);
-      const correlationId = crypto.randomUUID();
-      const execution: Execution = {
-        id: crypto.randomUUID(),
-        botSessionId: current.id,
-        requestedByUserId: message.userId,
-        prompt: message.text,
-        status: "pending",
-        correlationId,
-      };
-      await this.persistence.executions.save(execution);
-      await this.audit(
-        "execution.created",
-        message.userId,
-        current.id,
-        execution.id,
-        message.chatId,
-        correlationId,
-      );
+    const execution: Execution = {
+      id: crypto.randomUUID(),
+      botSessionId: current.id,
+      requestedByUserId: message.userId,
+      prompt: message.text,
+      status: "pending",
+      correlationId: crypto.randomUUID(),
+      ownerFence: 0,
+    };
+    await this.persistence.executions.save(execution);
+    await this.audit(
+      "execution.created",
+      message.userId,
+      current.id,
+      execution.id,
+      message.chatId,
+      execution.correlationId,
+    );
 
-      const abort = new AbortController();
-      let resolveDone!: () => void;
-      const done = new Promise<void>((resolve) => {
-        resolveDone = resolve;
+    const job: ExecutionJob = { executionId: execution.id };
+    if (this.jobQueue) {
+      // save() atomically creates the queued delivery intent; this idempotent enqueue is
+      // a delivery nudge that also supports queue implementations without that transaction.
+      await this.jobQueue.enqueue(job);
+    } else {
+      await this.queue.run(current.id, () => this.processJob(job));
+    }
+  }
+
+  private async processJob(job: ExecutionJob): Promise<ExecutionJobDisposition> {
+    const lease = await this.persistence.executions.claim(
+      job.executionId,
+      this.workerId,
+      this.clock.now(),
+      EXECUTION_LEASE_MS,
+    );
+    if (!lease) {
+      const execution = await this.persistence.executions.getById(job.executionId);
+      return execution?.status === "pending"
+        ? { disposition: "retry", delayMs: CANCELLATION_POLL_MS }
+        : { disposition: "ack" };
+    }
+    const execution = await this.persistence.executions.getById(job.executionId);
+    if (!execution) return { disposition: "ack" };
+    if (lease.recovered) {
+      await this.finishWithoutProvider(execution, lease, {
+        status: "unknown",
+        message: "Execution ownership expired; provider state was not guessed.",
       });
-      const active: ActiveExecution = {
-        execution,
-        executor,
-        abort,
-        interrupted: false,
-        done,
-        resolveDone,
-      };
-      this.active.set(current.id, active);
+      return { disposition: "ack" };
+    }
+    await this.executeClaimed(execution, lease);
+    return { disposition: "ack" };
+  }
 
-      let executorSession = current.executorSessionId
+  private async executeClaimed(execution: Execution, lease: ExecutionLease): Promise<void> {
+    const current = await this.persistence.sessions.getById(execution.botSessionId);
+    if (!current || current.status === "closed") {
+      await this.finishWithoutProvider(execution, lease, {
+        status: "failed",
+        message: current ? "Session is closed." : "Session no longer exists.",
+      });
+      return;
+    }
+    const executor = this.executors.require(current.executorId);
+    const project = await this.requireProject(current.projectId);
+    const abort = new AbortController();
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const active: ActiveExecution = {
+      execution,
+      executor,
+      abort,
+      lease,
+      interrupted: false,
+      ownershipLost: false,
+      done,
+      resolveDone,
+    };
+    this.active.set(current.id, active);
+    const renewTimer = setInterval(
+      () => {
+        void this.renewLease(active).catch(() => undefined);
+      },
+      Math.max(250, EXECUTION_LEASE_MS / 3),
+    );
+    const cancellationTimer = setInterval(() => {
+      void this.observeCancellation(active).catch(() => undefined);
+    }, CANCELLATION_POLL_MS);
+    let renderer: ThrottledEventRenderer | undefined;
+    let executorSession: ExecutorSession | undefined;
+    try {
+      executorSession = current.executorSessionId
         ? await this.persistence.executorSessions.getById(current.executorSessionId)
         : undefined;
+      const createdExecutorSession = !executorSession;
       if (!executorSession) {
         const now = this.clock.now();
         executorSession = {
@@ -495,162 +636,213 @@ export class AgentOrchestrator {
           createdAt: now,
           lastUsedAt: now,
         };
-        await this.persistence.executorSessions.save(executorSession);
       }
-      const executorSessionId = executorSession.id;
-      await this.persistence.sessions.save({
+      if (createdExecutorSession) {
+        await this.persistOwnedExecutorSession(active, executorSession);
+      }
+      await this.persistExecution(active, {
+        ...active.execution,
+        executorSessionId: executorSession.id,
+      });
+      await this.persistOwnedSession(active, {
         ...current,
         executorSessionId: executorSession.id,
         status: "starting",
         updatedAt: this.clock.now(),
       });
-
-      let renderer: ThrottledEventRenderer | undefined;
-      let finalized = false;
-      const finish = async (result: StreamResult): Promise<void> => {
-        if (finalized) return;
-        finalized = true;
-        const finishedAt = this.clock.now();
-        const finalStatus =
-          active.abort.signal.aborted && result.status === "completed"
-            ? { status: "stopped" as const, message: "Execution stopped." }
-            : result;
-        const finalExecution: Execution = {
-          ...active.execution,
-          status: finalStatus.status,
-          finishedAt,
-          ...(finalStatus.status === "completed" ? {} : { errorMessage: finalStatus.message }),
-        };
-        active.execution = finalExecution;
-        await this.persistence.executions.save(finalExecution);
-        const latest = await this.persistence.sessions.getById(current.id);
-        const sessionStatus =
-          latest?.status === "closed"
-            ? "closed"
-            : finalStatus.status === "completed"
-              ? "idle"
-              : finalStatus.status === "stopped"
-                ? "stopped"
-                : "failed";
-        await this.persistence.sessions.save({
-          ...(latest ?? current),
-          executorSessionId,
-          status: sessionStatus,
-          updatedAt: finishedAt,
-        });
-        if (renderer) {
-          await renderer.complete(
-            finalStatus.status === "completed"
-              ? "Completed"
-              : finalStatus.status === "stopped"
-                ? "Stopped"
-                : "Failed",
-            finalStatus.message,
-          );
-        }
-      };
-
-      try {
-        const hasNativeSession = Boolean(executorSession.nativeSessionId);
-        let agentSession: AgentSession;
-        if (hasNativeSession) {
-          if (!executorSession.resumable || !executor.capabilities().resume || !executor.resume) {
-            throw new ProtocolError("Executor cannot safely resume the persisted native session.");
-          }
-          const nativeSessionId = executorSession.nativeSessionId!;
-          const resumed = await executor.resume({
-            nativeSessionId,
-            projectId: project.id,
-            workspacePath: project.workspacePath,
-            signal: abort.signal,
-          });
-          if (resumed.nativeSessionId && resumed.nativeSessionId !== nativeSessionId) {
-            throw new ProtocolError("Executor returned a different native session during resume.");
-          }
-          agentSession = {
-            ...resumed,
-            nativeSessionId,
-            resumable: true,
-          };
-        } else {
-          agentSession = await executor.start({
-            projectId: project.id,
-            workspacePath: project.workspacePath,
-            signal: abort.signal,
-          });
-        }
-        active.agentSession = agentSession;
-        this.runtimeSessions.set(current.id, agentSession);
-        await this.interruptIfAborted(active);
-        executorSession = { ...executorSession, lastUsedAt: this.clock.now() };
-        await this.persistence.executorSessions.save(executorSession);
-
-        if (agentSession.nativeSessionId) {
-          executorSession = await this.persistNativeIdentity(
-            current.id,
-            executorSession,
-            agentSession.nativeSessionId,
-            agentSession.resumable ?? true,
-          );
-        }
-
-        active.execution = {
-          ...active.execution,
-          status: "running",
-          startedAt: this.clock.now(),
-          executorSessionId: executorSession.id,
-        };
-        await this.persistence.executions.save(active.execution);
-        await this.persistence.sessions.save({
-          ...((await this.persistence.sessions.getById(current.id)) ?? current),
-          executorSessionId: executorSession.id,
-          status: "running",
-          updatedAt: this.clock.now(),
-        });
-
-        renderer = new ThrottledEventRenderer(this.gateway, {
-          chatId: current.telegramChatId,
-          threadId: current.telegramThreadId,
-        });
-        await renderer.start(executor.name, project);
-
-        const result = await this.consumeStream(
-          current.id,
-          executorSession,
-          agentSession,
+      await this.observeCancellation(active);
+      if (active.abort.signal.aborted) {
+        await this.finish(
           active,
-          renderer,
-          message.text,
+          { status: "stopped", message: "Execution stopped before provider start." },
+          undefined,
+          executorSession.id,
         );
-        await finish(result);
-      } catch (error) {
+        return;
+      }
+
+      const hasNativeSession = Boolean(executorSession.nativeSessionId);
+      let agentSession: AgentSession;
+      if (hasNativeSession) {
+        if (!executorSession.resumable || !executor.capabilities().resume || !executor.resume) {
+          throw new ProtocolError("Executor cannot safely resume the persisted native session.");
+        }
+        const nativeSessionId = executorSession.nativeSessionId!;
+        const resumed = await executor.resume({
+          nativeSessionId,
+          projectId: project.id,
+          workspacePath: project.workspacePath,
+          signal: abort.signal,
+        });
+        if (resumed.nativeSessionId && resumed.nativeSessionId !== nativeSessionId) {
+          throw new ProtocolError("Executor returned a different native session during resume.");
+        }
+        agentSession = { ...resumed, nativeSessionId, resumable: true };
+      } else {
+        agentSession = await executor.start({
+          projectId: project.id,
+          workspacePath: project.workspacePath,
+          signal: abort.signal,
+        });
+      }
+      active.agentSession = agentSession;
+      this.runtimeSessions.set(current.id, agentSession);
+      await this.interruptIfAborted(active);
+      executorSession = { ...executorSession, lastUsedAt: this.clock.now() };
+      await this.persistOwnedExecutorSession(active, executorSession);
+      if (agentSession.nativeSessionId) {
+        executorSession = await this.persistNativeIdentity(
+          active,
+          executorSession,
+          agentSession.nativeSessionId,
+          agentSession.resumable ?? true,
+        );
+      }
+
+      await this.persistExecution(active, {
+        ...active.execution,
+        status: "running",
+        startedAt: active.execution.startedAt ?? this.clock.now(),
+        executorSessionId: executorSession.id,
+      });
+      await this.persistOwnedSession(active, {
+        ...((await this.persistence.sessions.getById(current.id)) ?? current),
+        executorSessionId: executorSession.id,
+        status: "running",
+        updatedAt: this.clock.now(),
+      });
+
+      renderer = new ThrottledEventRenderer(this.gateway, {
+        chatId: current.telegramChatId,
+        threadId: current.telegramThreadId,
+      });
+      await this.assertOwned(active);
+      await renderer.start(executor.name, project);
+      const result = await this.consumeStream(
+        active,
+        executorSession,
+        agentSession,
+        renderer,
+        execution.prompt,
+      );
+      await this.finish(active, result, renderer, executorSession.id);
+    } catch (error) {
+      if (error instanceof StaleExecutionOwnershipError) {
+        active.ownershipLost = true;
+      } else {
         if (error instanceof NativeSessionIdentityConflictError) {
           await this.audit(
             "execution.session_identity_conflict",
-            message.userId,
+            execution.requestedByUserId,
             current.id,
             execution.id,
-            message.chatId,
-            correlationId,
+            current.telegramChatId,
+            execution.correlationId,
           );
         }
-        await finish(
+        await this.finish(
+          active,
           abort.signal.aborted
             ? { status: "stopped", message: "Execution stopped." }
             : { status: "failed", message: `Execution failed: ${errorMessage(error)}` },
-        );
-      } finally {
-        this.active.delete(current.id);
-        active.resolveDone();
+          renderer,
+          executorSession?.id,
+        ).catch((finishError) => {
+          if (!(finishError instanceof StaleExecutionOwnershipError)) throw finishError;
+          active.ownershipLost = true;
+        });
       }
-    });
+    } finally {
+      clearInterval(renewTimer);
+      clearInterval(cancellationTimer);
+      if (this.active.get(current.id) === active) this.active.delete(current.id);
+      active.resolveDone();
+    }
+  }
+
+  private async finishWithoutProvider(
+    execution: Execution,
+    lease: ExecutionLease,
+    result: StreamResult,
+  ): Promise<void> {
+    await this.persistence.executions.updateOwned(
+      {
+        ...execution,
+        status: result.status,
+        finishedAt: this.clock.now(),
+        ownerFence: lease.fence,
+        errorMessage: result.status === "completed" ? undefined : result.message,
+      },
+      lease.ownerId,
+      lease.fence,
+      this.clock.now(),
+    );
+  }
+
+  private async finish(
+    active: ActiveExecution,
+    result: StreamResult,
+    renderer: ThrottledEventRenderer | undefined,
+    executorSessionId: string | undefined,
+  ): Promise<void> {
+    if (active.ownershipLost) return;
+    const finishedAt = this.clock.now();
+    const finalStatus =
+      active.abort.signal.aborted && result.status === "completed"
+        ? { status: "stopped" as const, message: "Execution stopped." }
+        : result;
+    const finalExecution: Execution = {
+      ...active.execution,
+      status: finalStatus.status,
+      finishedAt,
+      ...(finalStatus.status === "completed" ? {} : { errorMessage: finalStatus.message }),
+      ...(executorSessionId ? { executorSessionId } : {}),
+      ownerFence: active.lease.fence,
+    };
+    const current = await this.persistence.sessions.getById(active.execution.botSessionId);
+    const sessionStatus =
+      current?.status === "closed"
+        ? "closed"
+        : finalStatus.status === "completed"
+          ? "idle"
+          : finalStatus.status === "stopped"
+            ? "stopped"
+            : "failed";
+    if (current) {
+      await this.persistOwnedSession(active, {
+        ...current,
+        ...(executorSessionId ? { executorSessionId } : {}),
+        status: sessionStatus,
+        updatedAt: finishedAt,
+      });
+    }
+    const updated = await this.persistence.executions.updateOwned(
+      finalExecution,
+      active.lease.ownerId,
+      active.lease.fence,
+      finishedAt,
+    );
+    if (!updated) {
+      active.ownershipLost = true;
+      return;
+    }
+    active.execution = finalExecution;
+    if (renderer) {
+      await renderer.complete(
+        finalStatus.status === "completed"
+          ? "Completed"
+          : finalStatus.status === "stopped"
+            ? "Stopped"
+            : "Failed",
+        finalStatus.message,
+      );
+    }
   }
 
   private async consumeStream(
-    botSessionId: string,
+    active: ActiveExecution,
     executorSession: ExecutorSession,
     agentSession: AgentSession,
-    active: ActiveExecution,
     renderer: ThrottledEventRenderer,
     prompt: string,
   ): Promise<StreamResult> {
@@ -659,11 +851,12 @@ export class AgentOrchestrator {
       prompt,
       signal: active.abort.signal,
     })) {
+      await this.assertOwned(active);
       if (active.abort.signal.aborted) return { status: "stopped", message: "Execution stopped." };
       if (terminal) throw new ProtocolError("Executor emitted events after a terminal event");
       if (event.type === "session_identity") {
         executorSession = await this.persistNativeIdentity(
-          botSessionId,
+          active,
           executorSession,
           event.nativeSessionId,
           event.resumable,
@@ -672,11 +865,13 @@ export class AgentOrchestrator {
         agentSession = active.agentSession;
       }
       if (event.type === "approval_request") {
-        active.execution = { ...active.execution, status: "awaiting_approval" };
-        await this.persistence.executions.save(active.execution);
-        const current = await this.persistence.sessions.getById(botSessionId);
+        await this.persistExecution(active, {
+          ...active.execution,
+          status: "awaiting_approval",
+        });
+        const current = await this.persistence.sessions.getById(active.execution.botSessionId);
         if (current && current.status !== "closed") {
-          await this.persistence.sessions.save({
+          await this.persistOwnedSession(active, {
             ...current,
             executorSessionId: executorSession.id,
             status: "awaiting_approval",
@@ -684,6 +879,7 @@ export class AgentOrchestrator {
           });
         }
       }
+      await this.assertOwned(active);
       await renderer.handle(event);
       if (event.type === "error") {
         terminal = { status: "failed", message: event.message };
@@ -704,7 +900,7 @@ export class AgentOrchestrator {
   }
 
   private async persistNativeIdentity(
-    botSessionId: string,
+    active: ActiveExecution,
     executorSession: ExecutorSession,
     nativeSessionId: string,
     resumable: boolean,
@@ -723,16 +919,110 @@ export class AgentOrchestrator {
       resumable: executorSession.resumable || resumable,
       lastUsedAt: this.clock.now(),
     };
-    await this.persistence.executorSessions.save(updated);
-    const session = await this.persistence.sessions.getById(botSessionId);
+    await this.persistOwnedExecutorSession(active, updated);
+    const session = await this.persistence.sessions.getById(active.execution.botSessionId);
     if (session && session.status !== "closed") {
-      await this.persistence.sessions.save({
+      await this.persistOwnedSession(active, {
         ...session,
         executorSessionId: executorSession.id,
         updatedAt: this.clock.now(),
       });
     }
     return updated;
+  }
+
+  private async persistOwnedSession(active: ActiveExecution, session: BotSession): Promise<void> {
+    const updated = await this.persistence.sessions.updateOwned(
+      session,
+      active.execution.id,
+      active.lease.ownerId,
+      active.lease.fence,
+      this.clock.now(),
+    );
+    if (!updated) {
+      active.ownershipLost = true;
+      throw new StaleExecutionOwnershipError();
+    }
+  }
+
+  private async persistOwnedExecutorSession(
+    active: ActiveExecution,
+    session: ExecutorSession,
+  ): Promise<void> {
+    const updated = await this.persistence.executorSessions.updateOwned(
+      session,
+      active.execution.id,
+      active.lease.ownerId,
+      active.lease.fence,
+      this.clock.now(),
+    );
+    if (!updated) {
+      active.ownershipLost = true;
+      throw new StaleExecutionOwnershipError();
+    }
+  }
+
+  private async renewLease(active: ActiveExecution): Promise<void> {
+    if (active.abort.signal.aborted || active.ownershipLost) return;
+    const renewed = await this.persistence.executions.renew(
+      active.execution.id,
+      active.lease.ownerId,
+      active.lease.fence,
+      this.clock.now(),
+      EXECUTION_LEASE_MS,
+    );
+    if (!renewed) {
+      active.ownershipLost = true;
+      active.abort.abort();
+      await this.interruptActive(active);
+    } else {
+      active.execution = {
+        ...active.execution,
+        leaseExpiresAt: new Date(this.clock.now().getTime() + EXECUTION_LEASE_MS),
+      };
+    }
+  }
+
+  private async observeCancellation(active: ActiveExecution): Promise<void> {
+    if (active.abort.signal.aborted || active.ownershipLost) return;
+    const execution = await this.persistence.executions.getById(active.execution.id);
+    if (execution?.cancelRequestedAt) {
+      active.abort.abort();
+      await this.interruptActive(active);
+    }
+  }
+
+  private async assertOwned(active: ActiveExecution): Promise<void> {
+    const execution = await this.persistence.executions.getById(active.execution.id);
+    if (
+      !execution ||
+      execution.ownerId !== active.lease.ownerId ||
+      execution.ownerFence !== active.lease.fence ||
+      !execution.leaseExpiresAt ||
+      execution.leaseExpiresAt <= this.clock.now()
+    ) {
+      active.ownershipLost = true;
+      throw new StaleExecutionOwnershipError();
+    }
+  }
+
+  private async persistExecution(active: ActiveExecution, execution: Execution): Promise<void> {
+    await this.assertOwned(active);
+    const updated = await this.persistence.executions.updateOwned(
+      { ...execution, ownerId: active.lease.ownerId, ownerFence: active.lease.fence },
+      active.lease.ownerId,
+      active.lease.fence,
+      this.clock.now(),
+    );
+    if (!updated) {
+      active.ownershipLost = true;
+      throw new StaleExecutionOwnershipError();
+    }
+    active.execution = {
+      ...execution,
+      ownerId: active.lease.ownerId,
+      ownerFence: active.lease.fence,
+    };
   }
 
   private async interruptActive(active: ActiveExecution): Promise<void> {
@@ -756,7 +1046,15 @@ export class AgentOrchestrator {
     await this.queue.run(session.id, async () => {
       const current = await this.persistence.sessions.getById(session.id);
       if (!current || current.status === "closed") return;
-      if (this.active.has(session.id)) {
+      const executions = await this.persistence.executions.listBySession(session.id);
+      if (
+        executions.some(
+          (execution) =>
+            execution.status === "pending" ||
+            execution.status === "running" ||
+            execution.status === "awaiting_approval",
+        )
+      ) {
         throw new Error("An execution is active; use /stop before closing the session.");
       }
       const runtimeSession = this.runtimeSessions.get(session.id);
@@ -791,6 +1089,14 @@ export class AgentOrchestrator {
       ? await this.persistence.executorSessions.getById(session.executorSessionId)
       : undefined;
     const executor = this.executors.require(session.executorId);
+    const activeExecution = [...executions]
+      .reverse()
+      .find(
+        (execution) =>
+          execution.status === "pending" ||
+          execution.status === "running" ||
+          execution.status === "awaiting_approval",
+      );
     const active = this.active.get(session.id);
     const runtimeSession = this.runtimeSessions.get(session.id);
     return [
@@ -799,7 +1105,7 @@ export class AgentOrchestrator {
       `Executor: ${executor.name} (${executor.id})`,
       `Native session: ${executorSession?.nativeSessionId ?? "not established"}`,
       `Status: ${session.status}`,
-      `Active execution: ${active?.execution.status ?? "none"}`,
+      `Active execution: ${activeExecution?.status ?? active?.execution.status ?? "none"}`,
       `Resume supported: ${executor.capabilities().resume ? "yes" : "no"}`,
       `Last execution: ${last?.status ?? "none"}`,
     ].join("\n");
@@ -817,7 +1123,7 @@ export class AgentOrchestrator {
     sessionId: string,
     executionId?: string,
     chatId?: string,
-    correlationId = crypto.randomUUID(),
+    correlationId: string = crypto.randomUUID(),
   ): Promise<void> {
     await this.persistence.audit.append({
       action,

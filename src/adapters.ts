@@ -3,6 +3,7 @@ import {
   type AgentExecutor,
   type AgentInput,
   type AgentSession,
+  type AuditLog,
   type ExecutorCapabilities,
   type BotSession,
   type BotSessionRepository,
@@ -12,6 +13,9 @@ import {
   type StartSessionOptions,
   type ChatGateway,
   type Execution,
+  type ExecutionReconciliation,
+  type ExecutionReconciliationRepository,
+  type ExecutionReconciliationResult,
   type ExecutionRepository,
   type MessageRef,
   type Persistence,
@@ -226,9 +230,18 @@ export class InMemoryPersistence implements Persistence {
   readonly projects = new InMemoryProjects();
   readonly executions = new InMemoryExecutions();
   readonly sessions = new InMemorySessions(this.executions);
+  readonly audit = new InMemoryAuditLog();
+
+  constructor() {
+    this.executions.attachSessions(this.sessions);
+  }
+  readonly reconciliations = new InMemoryReconciliations(
+    this.executions,
+    this.sessions,
+    this.audit,
+  );
   readonly executorSessions = new InMemoryExecutorSessions(this.executions);
   readonly topics = new InMemoryTopics();
-  readonly audit = new InMemoryAuditLog();
 }
 
 class InMemoryProjects implements ProjectRepository {
@@ -261,6 +274,12 @@ class InMemorySessions implements BotSessionRepository {
     this.values.set(session.id, session);
   }
 
+  quarantineUnknown(sessionId: string, now: Date): void {
+    const session = this.values.get(sessionId);
+    if (!session || session.status === "closed") return;
+    this.values.set(sessionId, { ...session, status: "failed", updatedAt: now });
+  }
+
   async updateOwned(
     session: BotSession,
     executionId: string,
@@ -290,6 +309,25 @@ class InMemorySessions implements BotSessionRepository {
 
 class InMemoryExecutions implements ExecutionRepository {
   private readonly values = new Map<string, Execution>();
+  private readonly reconciledExecutionIds = new Set<string>();
+  private sessions?: InMemorySessions;
+
+  attachSessions(sessions: InMemorySessions): void {
+    this.sessions = sessions;
+  }
+
+  markReconciled(executionId: string): void {
+    this.reconciledExecutionIds.add(executionId);
+  }
+
+  hasUnresolvedUnknown(sessionId: string): boolean {
+    return [...this.values.values()].some(
+      (candidate) =>
+        candidate.botSessionId === sessionId &&
+        candidate.status === "unknown" &&
+        !this.reconciledExecutionIds.has(candidate.id),
+    );
+  }
 
   async getById(id: string): Promise<Execution | undefined> {
     return this.values.get(id);
@@ -297,6 +335,9 @@ class InMemoryExecutions implements ExecutionRepository {
 
   async save(execution: Execution): Promise<void> {
     this.values.set(execution.id, execution);
+    if (execution.status === "unknown" && this.hasUnresolvedUnknown(execution.botSessionId)) {
+      this.sessions?.quarantineUnknown(execution.botSessionId, new Date());
+    }
   }
 
   async listBySession(sessionId: string): Promise<readonly Execution[]> {
@@ -311,6 +352,7 @@ class InMemoryExecutions implements ExecutionRepository {
   ): Promise<import("./domain.js").ExecutionLease | undefined> {
     const execution = this.values.get(executionId);
     if (!execution || execution.status !== "pending") return undefined;
+    if (this.hasUnresolvedUnknown(execution.botSessionId)) return undefined;
     const active = [...this.values.values()].some(
       (candidate) =>
         candidate.botSessionId === execution.botSessionId &&
@@ -371,6 +413,9 @@ class InMemoryExecutions implements ExecutionRepository {
     fence: number,
     now: Date,
   ): Promise<boolean> {
+    if (execution.status === "unknown") {
+      return this.updateOwnedUnknown({ ...execution, status: "unknown" }, ownerId, fence, now);
+    }
     const current = this.values.get(execution.id);
     if (
       !current ||
@@ -386,11 +431,41 @@ class InMemoryExecutions implements ExecutionRepository {
       ...(execution.status === "completed" ||
       execution.status === "failed" ||
       execution.status === "stopped" ||
-      execution.status === "interrupted" ||
-      execution.status === "unknown"
+      execution.status === "interrupted"
         ? { ownerId: undefined, leaseExpiresAt: undefined }
         : { ownerId, leaseExpiresAt: execution.leaseExpiresAt }),
     });
+    return true;
+  }
+
+  async updateOwnedUnknown(
+    execution: Execution & { status: "unknown" },
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    if (execution.status !== "unknown") {
+      throw new Error("Owned unknown update requires an unknown execution.");
+    }
+    const current = this.values.get(execution.id);
+    if (
+      !current ||
+      current.botSessionId !== execution.botSessionId ||
+      current.ownerId !== ownerId ||
+      current.ownerFence !== fence ||
+      (current.status !== "running" && current.status !== "awaiting_approval") ||
+      !current.leaseExpiresAt ||
+      current.leaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    this.values.set(execution.id, {
+      ...execution,
+      ownerId: undefined,
+      ownerFence: fence,
+      leaseExpiresAt: undefined,
+    });
+    this.sessions?.quarantineUnknown(execution.botSessionId, now);
     return true;
   }
 
@@ -441,6 +516,11 @@ class InMemoryExecutions implements ExecutionRepository {
         recovered.push(updated);
       }
     }
+    for (const execution of this.values.values()) {
+      if (execution.status === "unknown" && this.hasUnresolvedUnknown(execution.botSessionId)) {
+        this.sessions?.quarantineUnknown(execution.botSessionId, now);
+      }
+    }
     const pending = [...this.values.values()].filter((execution) => execution.status === "pending");
     for (const execution of pending) {
       if (execution.ownerId || execution.leaseExpiresAt) {
@@ -452,6 +532,77 @@ class InMemoryExecutions implements ExecutionRepository {
       }
     }
     return [...recovered, ...pending];
+  }
+}
+
+class InMemoryReconciliations implements ExecutionReconciliationRepository {
+  private readonly values = new Map<string, ExecutionReconciliation>();
+  private readonly tails = new Map<string, Promise<void>>();
+
+  constructor(
+    private readonly executions: InMemoryExecutions,
+    private readonly sessions: InMemorySessions,
+    private readonly audit: AuditLog,
+  ) {}
+
+  async listBySession(sessionId: string): Promise<readonly ExecutionReconciliation[]> {
+    const executions = await this.executions.listBySession(sessionId);
+    const ids = new Set(executions.map((execution) => execution.id));
+    return [...this.values.values()].filter((item) => ids.has(item.executionId));
+  }
+
+  async reconcile(
+    executionId: string,
+    botSessionId: string,
+    reconciliation: ExecutionReconciliation,
+  ): Promise<ExecutionReconciliationResult> {
+    const previous = this.tails.get(executionId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.tails.set(executionId, tail);
+    await previous;
+    try {
+      const existing = this.values.get(executionId);
+      if (existing) return { status: "already_reconciled", reconciliation: existing };
+      const execution = await this.executions.getById(executionId);
+      if (!execution) return { status: "not_found" };
+      if (execution.botSessionId !== botSessionId) return { status: "wrong_session" };
+      if (execution.status !== "unknown") return { status: "not_unknown" };
+      const note = reconciliation.note.trim();
+      const reconciledByUserId = reconciliation.reconciledByUserId.trim();
+      if (!note) throw new Error("Reconciliation note is required.");
+      if (!reconciledByUserId) throw new Error("Reconciled user is required.");
+      if (reconciliation.executionId !== executionId) {
+        throw new Error("Reconciliation execution ID does not match the target.");
+      }
+      const saved = { ...reconciliation, reconciledByUserId, note };
+      this.values.set(executionId, saved);
+      this.executions.markReconciled(executionId);
+      const session = await this.sessions.getById(botSessionId);
+      if (session && session.status !== "closed") {
+        await this.sessions.save({
+          ...session,
+          status: this.executions.hasUnresolvedUnknown(botSessionId) ? "failed" : "idle",
+          updatedAt: reconciliation.reconciledAt,
+        });
+      }
+      await this.audit.append({
+        action: "execution.reconciled",
+        userId: reconciledByUserId,
+        ...(session ? { chatId: session.telegramChatId } : {}),
+        sessionId: botSessionId,
+        executionId,
+        correlationId: execution.correlationId,
+        metadata: { outcome: saved.outcome },
+      });
+      return { status: "reconciled", reconciliation: saved };
+    } finally {
+      release();
+      if (this.tails.get(executionId) === tail) this.tails.delete(executionId);
+    }
   }
 }
 

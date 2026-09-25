@@ -241,6 +241,15 @@ test("stale owner fences cannot mutate after deterministic recovery", async () =
     expect(oldLease?.fence).toBe(1);
     const recovered = await current.persistence.executions.recoverAfterRestart(new Date(3_000));
     expect(recovered.find((execution) => execution.id === oldExecution.id)?.status).toBe("unknown");
+    expect(
+      await current.persistence.reconciliations.reconcile(oldExecution.id, session.id, {
+        executionId: oldExecution.id,
+        outcome: "abandoned",
+        reconciledByUserId: "operator",
+        note: "no reliable result",
+        reconciledAt: new Date(3_001),
+      }),
+    ).toMatchObject({ status: "reconciled" });
 
     const newExecution: Execution = {
       ...oldExecution,
@@ -339,6 +348,199 @@ test("duplicate and terminal job delivery never replays a provider", async () =>
     await current.orchestrator.shutdown();
     current.persistence.db.close();
   } finally {
+    unlinkSync(path);
+  }
+});
+
+test("owned unknown transition atomically quarantines across independent SQLite handles", async () => {
+  const path = join(tmpdir(), `telegram-bot-unknown-atomic-${crypto.randomUUID()}.sqlite`);
+  const current = await fixture(path, new FakeAgentExecutor());
+  let second: SqlitePersistence | undefined;
+  try {
+    const session = await createSession(current.orchestrator);
+    second = SqlitePersistence.open(path);
+    const execution: Execution = {
+      id: crypto.randomUUID(),
+      botSessionId: session.id,
+      requestedByUserId: "operator",
+      prompt: "ambiguous",
+      status: "pending",
+      correlationId: crypto.randomUUID(),
+      ownerFence: 0,
+    };
+    await current.persistence.executions.save(execution);
+    const staleLease = await current.persistence.executions.claim(
+      execution.id,
+      "old-worker",
+      new Date(1_000),
+      1_000,
+    );
+    const validLease = await second.executions.claim(
+      execution.id,
+      "new-worker",
+      new Date(2_000),
+      1_000,
+    );
+    expect(staleLease?.fence).toBe(1);
+    expect(validLease).toMatchObject({ fence: 2, recovered: true });
+
+    const staleResult = await current.persistence.executions.updateOwnedUnknown(
+      { ...execution, status: "unknown", ownerFence: staleLease!.fence },
+      staleLease!.ownerId,
+      staleLease!.fence,
+      new Date(2_001),
+    );
+    expect(staleResult).toBe(false);
+    expect(await second.executions.getById(execution.id)).toMatchObject({ status: "running" });
+    expect((await second.sessions.getById(session.id))?.status).toBe("idle");
+
+    const unknown = {
+      ...execution,
+      status: "unknown" as const,
+      ownerFence: validLease!.fence,
+      finishedAt: new Date(2_001),
+    };
+    expect(
+      await second.executions.updateOwnedUnknown(
+        unknown,
+        validLease!.ownerId,
+        validLease!.fence,
+        new Date(2_001),
+      ),
+    ).toBe(true);
+    const persistedUnknown = await current.persistence.executions.getById(execution.id);
+    expect(persistedUnknown?.status).toBe("unknown");
+    expect(persistedUnknown?.ownerId).toBeUndefined();
+    expect(persistedUnknown?.leaseExpiresAt).toBeUndefined();
+    expect((await current.persistence.sessions.getById(session.id))?.status).toBe("failed");
+
+    const closedSession = await createSession(current.orchestrator);
+    const closedExecution: Execution = {
+      ...execution,
+      id: crypto.randomUUID(),
+      botSessionId: closedSession.id,
+      correlationId: crypto.randomUUID(),
+    };
+    await current.persistence.executions.save(closedExecution);
+    const closedLease = await current.persistence.executions.claim(
+      closedExecution.id,
+      "closed-worker",
+      new Date(3_000),
+      5_000,
+    );
+    await current.persistence.sessions.save({
+      ...closedSession,
+      status: "closed",
+      updatedAt: new Date(3_001),
+    });
+    expect(
+      await current.persistence.executions.updateOwnedUnknown(
+        { ...closedExecution, status: "unknown", ownerFence: closedLease!.fence },
+        closedLease!.ownerId,
+        closedLease!.fence,
+        new Date(3_002),
+      ),
+    ).toBe(true);
+    expect((await second.sessions.getById(closedSession.id))?.status).toBe("closed");
+  } finally {
+    second?.db.close();
+    await current.orchestrator.shutdown();
+    current.persistence.db.close();
+    unlinkSync(path);
+  }
+});
+
+test("restart repairs only unresolved unknown session quarantine", async () => {
+  const path = join(tmpdir(), `telegram-bot-unknown-repair-${crypto.randomUUID()}.sqlite`);
+  const current = await fixture(path, new FakeAgentExecutor());
+  try {
+    const unresolvedSession = await createSession(current.orchestrator);
+    const resolvedSession = await createSession(current.orchestrator);
+    const closedSession = await createSession(current.orchestrator);
+    const makeUnknown = (botSessionId: string): Execution => ({
+      id: crypto.randomUUID(),
+      botSessionId,
+      requestedByUserId: "operator",
+      prompt: "legacy",
+      status: "unknown",
+      correlationId: crypto.randomUUID(),
+      ownerFence: 1,
+    });
+    const unresolvedOne = makeUnknown(unresolvedSession.id);
+    const unresolvedTwo = makeUnknown(unresolvedSession.id);
+    const resolved = makeUnknown(resolvedSession.id);
+    const closed = makeUnknown(closedSession.id);
+    for (const execution of [unresolvedOne, unresolvedTwo, resolved, closed]) {
+      await current.persistence.executions.save(execution);
+    }
+    await current.persistence.reconciliations.reconcile(resolved.id, resolvedSession.id, {
+      executionId: resolved.id,
+      outcome: "abandoned",
+      reconciledByUserId: "operator",
+      note: "verified",
+      reconciledAt: new Date(4_000),
+    });
+    await current.persistence.sessions.save({
+      ...unresolvedSession,
+      status: "idle",
+      updatedAt: new Date(4_001),
+    });
+    await current.persistence.sessions.save({
+      ...resolvedSession,
+      status: "idle",
+      updatedAt: new Date(4_001),
+    });
+    await current.persistence.sessions.save({
+      ...closedSession,
+      status: "closed",
+      updatedAt: new Date(4_001),
+    });
+
+    await current.persistence.executions.recoverAfterRestart(new Date(5_000));
+    expect((await current.persistence.sessions.getById(unresolvedSession.id))?.status).toBe(
+      "failed",
+    );
+    expect((await current.persistence.sessions.getById(resolvedSession.id))?.status).toBe("idle");
+    expect((await current.persistence.sessions.getById(closedSession.id))?.status).toBe("closed");
+  } finally {
+    await current.orchestrator.shutdown();
+    current.persistence.db.close();
+    unlinkSync(path);
+  }
+});
+
+test("unknown quarantine audit omits raw provider error text", async () => {
+  const path = join(tmpdir(), `telegram-bot-unknown-audit-${crypto.randomUUID()}.sqlite`);
+  const current = await fixture(path, new FakeAgentExecutor());
+  try {
+    const session = await createSession(current.orchestrator);
+    const sensitive = "provider-token=super-secret raw-argv=--api-key abc123";
+    const execution: Execution = {
+      id: crypto.randomUUID(),
+      botSessionId: session.id,
+      requestedByUserId: "operator",
+      prompt: "private prompt",
+      status: "unknown",
+      correlationId: crypto.randomUUID(),
+      errorMessage: sensitive,
+      ownerFence: 1,
+    };
+    await current.persistence.executions.save(execution);
+    const internal = current.orchestrator as unknown as {
+      quarantineUnknown(execution: Execution): Promise<void>;
+    };
+    await internal.quarantineUnknown(execution);
+    await current.orchestrator.handleMessage(message(session.telegramThreadId, "/status"));
+
+    expect(current.gateway.sent.map((item) => item.text).join("\n")).not.toContain(sensitive);
+    const auditRows = current.persistence.db
+      .query<{ metadata: string | null }, any>("SELECT metadata FROM audit_log")
+      .all();
+    expect(JSON.stringify(auditRows)).not.toContain(sensitive);
+    expect(auditRows).toContainEqual({ metadata: null });
+  } finally {
+    await current.orchestrator.shutdown();
+    current.persistence.db.close();
     unlinkSync(path);
   }
 });
@@ -523,6 +725,17 @@ test("expired same-session execution blocks pending delivery until reconciliatio
     await waitUntil(
       async () => (await current!.persistence.executions.getById(expired.id))?.status === "unknown",
     );
+    expect((await current.persistence.executions.getById(pending.id))?.status).toBe("pending");
+    expect(executor.sends).toHaveLength(0);
+    expect(
+      await current.persistence.reconciliations.reconcile(expired.id, session.id, {
+        executionId: expired.id,
+        outcome: "confirmed_completed",
+        reconciledByUserId: "operator",
+        note: "verified externally",
+        reconciledAt: new Date(),
+      }),
+    ).toMatchObject({ status: "reconciled" });
     await waitUntil(
       async () =>
         (await current!.persistence.executions.getById(pending.id))?.status === "completed",
@@ -756,6 +969,125 @@ test("startup reconciles a claimed execution fail-closed without provider restar
     await second.orchestrator.shutdown();
     second.persistence.db.close();
   } finally {
+    unlinkSync(path);
+  }
+});
+
+function reconciliationUnknownExecution(botSessionId: string): Execution {
+  return {
+    id: crypto.randomUUID(),
+    botSessionId,
+    requestedByUserId: "operator",
+    prompt: "ambiguous",
+    status: "unknown",
+    correlationId: crypto.randomUUID(),
+    finishedAt: new Date(1_000),
+    errorMessage: "Executor stream ended without a terminal event.",
+    ownerFence: 1,
+  };
+}
+
+function reconciliationPendingExecution(botSessionId: string): Execution {
+  return {
+    id: crypto.randomUUID(),
+    botSessionId,
+    requestedByUserId: "operator",
+    prompt: "a2",
+    status: "pending",
+    correlationId: crypto.randomUUID(),
+    ownerFence: 0,
+  };
+}
+
+test("SQLite claim quarantine survives independent handles and reconciliation races", async () => {
+  const path = join(tmpdir(), `telegram-bot-m4-${crypto.randomUUID()}.sqlite`);
+  try {
+    const first = await fixture(path, new FakeAgentExecutor());
+    const session = await createSession(first.orchestrator);
+    const unknown = reconciliationUnknownExecution(session.id);
+    const pending = reconciliationPendingExecution(session.id);
+    insertExecutionWithJob(first.persistence, unknown);
+    insertExecutionWithJob(first.persistence, pending);
+    const second = SqlitePersistence.open(path);
+
+    expect(
+      await second.executions.claim(pending.id, "worker", new Date(2_000), 1_000),
+    ).toBeUndefined();
+    const [left, right] = await Promise.all([
+      first.persistence.reconciliations.reconcile(unknown.id, session.id, {
+        executionId: unknown.id,
+        outcome: "confirmed_completed",
+        reconciledByUserId: "operator-a",
+        note: "verified externally",
+        reconciledAt: new Date(2_001),
+      }),
+      second.reconciliations.reconcile(unknown.id, session.id, {
+        executionId: unknown.id,
+        outcome: "abandoned",
+        reconciledByUserId: "operator-b",
+        note: "no reliable result",
+        reconciledAt: new Date(2_002),
+      }),
+    ]);
+    expect([left, right].filter((result) => result.status === "reconciled")).toHaveLength(1);
+    expect([left, right].filter((result) => result.status === "already_reconciled")).toHaveLength(
+      1,
+    );
+    expect(
+      await second.executions.claim(pending.id, "worker", new Date(2_003), 1_000),
+    ).toMatchObject({
+      executionId: pending.id,
+    });
+    second.db.close();
+    first.persistence.db.close();
+  } finally {
+    unlinkSync(path);
+  }
+});
+
+test("restart preserves unresolved quarantine and resolved reconciliation", async () => {
+  const path = join(tmpdir(), `telegram-bot-m4-restart-${crypto.randomUUID()}.sqlite`);
+  const executor = new FakeAgentExecutor();
+  let first: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    first = await fixture(path, executor);
+    const session = await createSession(first.orchestrator);
+    const unknown = reconciliationUnknownExecution(session.id);
+    const pending = reconciliationPendingExecution(session.id);
+    insertExecutionWithJob(first.persistence, unknown);
+    insertExecutionWithJob(first.persistence, pending);
+    await first.persistence.sessions.save({ ...session, status: "failed" });
+    first.persistence.db.close();
+    first = undefined;
+
+    const second = await fixture(path, executor);
+    await second.orchestrator.start();
+    expect((await second.persistence.executions.getById(unknown.id))?.status).toBe("unknown");
+    expect((await second.persistence.executions.getById(pending.id))?.status).toBe("pending");
+    expect(executor.starts).toHaveLength(0);
+    await second.persistence.reconciliations.reconcile(unknown.id, session.id, {
+      executionId: unknown.id,
+      outcome: "abandoned",
+      reconciledByUserId: "operator",
+      note: "no reliable result",
+      reconciledAt: new Date(),
+    });
+    await waitUntil(
+      async () => (await second.persistence.executions.getById(pending.id))?.status === "completed",
+    );
+    expect(executor.sends.map((item) => item.input.prompt)).toEqual(["a2"]);
+    await second.orchestrator.shutdown();
+    second.persistence.db.close();
+
+    const third = SqlitePersistence.open(path);
+    expect((await third.executions.getById(unknown.id))?.status).toBe("unknown");
+    expect((await third.sessions.getById(session.id))?.status).toBe("idle");
+    expect(await third.reconciliations.listBySession(session.id)).toMatchObject([
+      { executionId: unknown.id, outcome: "abandoned" },
+    ]);
+    third.db.close();
+  } finally {
+    if (first) first.persistence.db.close();
     unlinkSync(path);
   }
 });

@@ -241,6 +241,15 @@ test("stale owner fences cannot mutate after deterministic recovery", async () =
     expect(oldLease?.fence).toBe(1);
     const recovered = await current.persistence.executions.recoverAfterRestart(new Date(3_000));
     expect(recovered.find((execution) => execution.id === oldExecution.id)?.status).toBe("unknown");
+    expect(
+      await current.persistence.reconciliations.reconcile(oldExecution.id, session.id, {
+        executionId: oldExecution.id,
+        outcome: "abandoned",
+        reconciledByUserId: "operator",
+        note: "no reliable result",
+        reconciledAt: new Date(3_001),
+      }),
+    ).toMatchObject({ status: "reconciled" });
 
     const newExecution: Execution = {
       ...oldExecution,
@@ -523,6 +532,17 @@ test("expired same-session execution blocks pending delivery until reconciliatio
     await waitUntil(
       async () => (await current!.persistence.executions.getById(expired.id))?.status === "unknown",
     );
+    expect((await current.persistence.executions.getById(pending.id))?.status).toBe("pending");
+    expect(executor.sends).toHaveLength(0);
+    expect(
+      await current.persistence.reconciliations.reconcile(expired.id, session.id, {
+        executionId: expired.id,
+        outcome: "confirmed_completed",
+        reconciledByUserId: "operator",
+        note: "verified externally",
+        reconciledAt: new Date(),
+      }),
+    ).toMatchObject({ status: "reconciled" });
     await waitUntil(
       async () =>
         (await current!.persistence.executions.getById(pending.id))?.status === "completed",
@@ -756,6 +776,125 @@ test("startup reconciles a claimed execution fail-closed without provider restar
     await second.orchestrator.shutdown();
     second.persistence.db.close();
   } finally {
+    unlinkSync(path);
+  }
+});
+
+function reconciliationUnknownExecution(botSessionId: string): Execution {
+  return {
+    id: crypto.randomUUID(),
+    botSessionId,
+    requestedByUserId: "operator",
+    prompt: "ambiguous",
+    status: "unknown",
+    correlationId: crypto.randomUUID(),
+    finishedAt: new Date(1_000),
+    errorMessage: "Executor stream ended without a terminal event.",
+    ownerFence: 1,
+  };
+}
+
+function reconciliationPendingExecution(botSessionId: string): Execution {
+  return {
+    id: crypto.randomUUID(),
+    botSessionId,
+    requestedByUserId: "operator",
+    prompt: "a2",
+    status: "pending",
+    correlationId: crypto.randomUUID(),
+    ownerFence: 0,
+  };
+}
+
+test("SQLite claim quarantine survives independent handles and reconciliation races", async () => {
+  const path = join(tmpdir(), `telegram-bot-m4-${crypto.randomUUID()}.sqlite`);
+  try {
+    const first = await fixture(path, new FakeAgentExecutor());
+    const session = await createSession(first.orchestrator);
+    const unknown = reconciliationUnknownExecution(session.id);
+    const pending = reconciliationPendingExecution(session.id);
+    insertExecutionWithJob(first.persistence, unknown);
+    insertExecutionWithJob(first.persistence, pending);
+    const second = SqlitePersistence.open(path);
+
+    expect(
+      await second.executions.claim(pending.id, "worker", new Date(2_000), 1_000),
+    ).toBeUndefined();
+    const [left, right] = await Promise.all([
+      first.persistence.reconciliations.reconcile(unknown.id, session.id, {
+        executionId: unknown.id,
+        outcome: "confirmed_completed",
+        reconciledByUserId: "operator-a",
+        note: "verified externally",
+        reconciledAt: new Date(2_001),
+      }),
+      second.reconciliations.reconcile(unknown.id, session.id, {
+        executionId: unknown.id,
+        outcome: "abandoned",
+        reconciledByUserId: "operator-b",
+        note: "no reliable result",
+        reconciledAt: new Date(2_002),
+      }),
+    ]);
+    expect([left, right].filter((result) => result.status === "reconciled")).toHaveLength(1);
+    expect([left, right].filter((result) => result.status === "already_reconciled")).toHaveLength(
+      1,
+    );
+    expect(
+      await second.executions.claim(pending.id, "worker", new Date(2_003), 1_000),
+    ).toMatchObject({
+      executionId: pending.id,
+    });
+    second.db.close();
+    first.persistence.db.close();
+  } finally {
+    unlinkSync(path);
+  }
+});
+
+test("restart preserves unresolved quarantine and resolved reconciliation", async () => {
+  const path = join(tmpdir(), `telegram-bot-m4-restart-${crypto.randomUUID()}.sqlite`);
+  const executor = new FakeAgentExecutor();
+  let first: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    first = await fixture(path, executor);
+    const session = await createSession(first.orchestrator);
+    const unknown = reconciliationUnknownExecution(session.id);
+    const pending = reconciliationPendingExecution(session.id);
+    insertExecutionWithJob(first.persistence, unknown);
+    insertExecutionWithJob(first.persistence, pending);
+    await first.persistence.sessions.save({ ...session, status: "failed" });
+    first.persistence.db.close();
+    first = undefined;
+
+    const second = await fixture(path, executor);
+    await second.orchestrator.start();
+    expect((await second.persistence.executions.getById(unknown.id))?.status).toBe("unknown");
+    expect((await second.persistence.executions.getById(pending.id))?.status).toBe("pending");
+    expect(executor.starts).toHaveLength(0);
+    await second.persistence.reconciliations.reconcile(unknown.id, session.id, {
+      executionId: unknown.id,
+      outcome: "abandoned",
+      reconciledByUserId: "operator",
+      note: "no reliable result",
+      reconciledAt: new Date(),
+    });
+    await waitUntil(
+      async () => (await second.persistence.executions.getById(pending.id))?.status === "completed",
+    );
+    expect(executor.sends.map((item) => item.input.prompt)).toEqual(["a2"]);
+    await second.orchestrator.shutdown();
+    second.persistence.db.close();
+
+    const third = SqlitePersistence.open(path);
+    expect((await third.executions.getById(unknown.id))?.status).toBe("unknown");
+    expect((await third.sessions.getById(session.id))?.status).toBe("idle");
+    expect(await third.reconciliations.listBySession(session.id)).toMatchObject([
+      { executionId: unknown.id, outcome: "abandoned" },
+    ]);
+    third.db.close();
+  } finally {
+    if (first) first.persistence.db.close();
     unlinkSync(path);
   }
 });

@@ -12,6 +12,9 @@ import {
   type StartSessionOptions,
   type ChatGateway,
   type Execution,
+  type ExecutionReconciliation,
+  type ExecutionReconciliationRepository,
+  type ExecutionReconciliationResult,
   type ExecutionRepository,
   type MessageRef,
   type Persistence,
@@ -226,6 +229,7 @@ export class InMemoryPersistence implements Persistence {
   readonly projects = new InMemoryProjects();
   readonly executions = new InMemoryExecutions();
   readonly sessions = new InMemorySessions(this.executions);
+  readonly reconciliations = new InMemoryReconciliations(this.executions, this.sessions);
   readonly executorSessions = new InMemoryExecutorSessions(this.executions);
   readonly topics = new InMemoryTopics();
   readonly audit = new InMemoryAuditLog();
@@ -290,6 +294,20 @@ class InMemorySessions implements BotSessionRepository {
 
 class InMemoryExecutions implements ExecutionRepository {
   private readonly values = new Map<string, Execution>();
+  private readonly reconciledExecutionIds = new Set<string>();
+
+  markReconciled(executionId: string): void {
+    this.reconciledExecutionIds.add(executionId);
+  }
+
+  hasUnresolvedUnknown(sessionId: string): boolean {
+    return [...this.values.values()].some(
+      (candidate) =>
+        candidate.botSessionId === sessionId &&
+        candidate.status === "unknown" &&
+        !this.reconciledExecutionIds.has(candidate.id),
+    );
+  }
 
   async getById(id: string): Promise<Execution | undefined> {
     return this.values.get(id);
@@ -311,6 +329,7 @@ class InMemoryExecutions implements ExecutionRepository {
   ): Promise<import("./domain.js").ExecutionLease | undefined> {
     const execution = this.values.get(executionId);
     if (!execution || execution.status !== "pending") return undefined;
+    if (this.hasUnresolvedUnknown(execution.botSessionId)) return undefined;
     const active = [...this.values.values()].some(
       (candidate) =>
         candidate.botSessionId === execution.botSessionId &&
@@ -452,6 +471,67 @@ class InMemoryExecutions implements ExecutionRepository {
       }
     }
     return [...recovered, ...pending];
+  }
+}
+
+class InMemoryReconciliations implements ExecutionReconciliationRepository {
+  private readonly values = new Map<string, ExecutionReconciliation>();
+  private readonly tails = new Map<string, Promise<void>>();
+
+  constructor(
+    private readonly executions: InMemoryExecutions,
+    private readonly sessions: InMemorySessions,
+  ) {}
+
+  async listBySession(sessionId: string): Promise<readonly ExecutionReconciliation[]> {
+    const executions = await this.executions.listBySession(sessionId);
+    const ids = new Set(executions.map((execution) => execution.id));
+    return [...this.values.values()].filter((item) => ids.has(item.executionId));
+  }
+
+  async reconcile(
+    executionId: string,
+    botSessionId: string,
+    reconciliation: ExecutionReconciliation,
+  ): Promise<ExecutionReconciliationResult> {
+    const previous = this.tails.get(executionId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.tails.set(executionId, tail);
+    await previous;
+    try {
+      const existing = this.values.get(executionId);
+      if (existing) return { status: "already_reconciled", reconciliation: existing };
+      const execution = await this.executions.getById(executionId);
+      if (!execution) return { status: "not_found" };
+      if (execution.botSessionId !== botSessionId) return { status: "wrong_session" };
+      if (execution.status !== "unknown") return { status: "not_unknown" };
+      const note = reconciliation.note.trim();
+      const reconciledByUserId = reconciliation.reconciledByUserId.trim();
+      if (!note) throw new Error("Reconciliation note is required.");
+      if (!reconciledByUserId) throw new Error("Reconciled user is required.");
+      if (reconciliation.executionId !== executionId) {
+        throw new Error("Reconciliation execution ID does not match the target.");
+      }
+      const saved = { ...reconciliation, reconciledByUserId, note };
+      this.values.set(executionId, saved);
+      this.executions.markReconciled(executionId);
+      const session = await this.sessions.getById(botSessionId);
+      if (session && session.status !== "closed") {
+        await this.sessions.save({
+          ...session,
+          status: this.executions.hasUnresolvedUnknown(botSessionId) ? "failed" : "idle",
+          updatedAt: reconciliation.reconciledAt,
+        });
+      }
+      return { status: "reconciled", reconciliation: saved };
+    } finally {
+      release();
+      if (this.tails.get(executionId) === tail) this.tails.delete(executionId);
+    }
   }
 }
 

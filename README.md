@@ -1,8 +1,8 @@
 # Telegram Coding Agent Bot
 
-Bot Telegram pluggabile per pilotare coding agent CLI tramite Forum Topics. M3 aggiunge orchestrazione durable e recovery restart-safe; il core resta provider-neutral.
+Bot Telegram pluggabile per pilotare coding agent CLI tramite Forum Topics. M3 aggiunge orchestrazione durable e recovery restart-safe; M4 aggiunge reconciliation operativa per gli esiti provider incerti. Il core resta provider-neutral.
 
-## Stato M3
+## Stato M4
 
 - dominio tipizzato: `Project`, `BotSession`, `Execution`, runtime `AgentSession`, persisted `ExecutorSession`, `TelegramTopic`, `ApprovalRequest`;
 - native provider identity discovered from the event stream and persisted separately from Telegram/runtime IDs;
@@ -15,7 +15,9 @@ Bot Telegram pluggabile per pilotare coding agent CLI tramite Forum Topics. M3 a
 - adapter reali Codex CLI e Claude Code con fresh execution, resume esatto, identity validation e cancellation;
 - process boundary con `spawn(executable, argv)`, stdin strutturato e nessuna shell interpolation;
 - `/session` mostra stato conciso senza token, environment o command line sensibili;
-- `FakeAgentExecutor` e process fakes mantengono i test deterministici senza provider installati.
+- `FakeAgentExecutor` e process fakes mantengono i test deterministici senza provider installati;
+- un execution `unknown` mette in quarantena il BotSession: nessun prompt successivo raggiunge il provider fino a reconciliation esplicita;
+- la reconciliation è un’asserzione operativa immutabile, non una prova del provider, e non invoca mai `start`, `resume`, `send`, `interrupt` o `close`.
 
 Le capability e il lifecycle provider sono documentati in [docs/architecture.md](docs/architecture.md).
 
@@ -45,7 +47,7 @@ Nel topic `Control`:
 /new ai-office codex "PR61 hardening"
 ```
 
-Il bot crea il topic operativo e un messaggio plain text nel nuovo topic diventa un `Execution` inviato all’adapter configurato. Nel topic operativo `/session` o `/session info` mostra topic, runtime ID, executor, native ID, stato e supporto resume.
+Il bot crea il topic operativo e un messaggio plain text nel nuovo topic diventa un `Execution` inviato all’adapter configurato. Nel topic operativo `/session` o `/session info` mostra topic, runtime ID, executor, native ID, stato e supporto resume. Se un execution è `unknown`, il topic resta bloccato e `/reconcile status` mostra l’ambiguità senza stampare il prompt.
 
 ## Layout
 
@@ -64,6 +66,18 @@ docs/               architettura, threat model e ADR
 ```
 
 ## Comandi
+
+Nel topic operativo:
+
+```text
+/status
+/reconcile
+/reconcile status
+/reconcile <execution-id> complete <reason>
+/reconcile <execution-id> abandon <reason>
+```
+
+`/reconcile` e `/reconcile status` richiedono ruolo `viewer`; `complete` e `abandon` richiedono ruolo `operator`. Le due mutazioni registrano una sola reconciliation immutabile: `complete` significa `confirmed_completed`, mentre `abandon` sblocca senza dichiarare che il provider abbia completato. Ogni retry futuro è un nuovo execution.
 
 ```bash
 bun run check       # typecheck + ESLint + test + Prettier

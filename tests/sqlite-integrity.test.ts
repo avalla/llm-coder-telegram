@@ -22,7 +22,7 @@ test("fresh SQLite migration enables integrity constraints", () => {
     db
       .query<{ version: number }, any>("SELECT version FROM schema_migrations ORDER BY version")
       .all(),
-  ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+  ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
 
   expect(() =>
     db
@@ -46,6 +46,42 @@ test("fresh SQLite migration enables integrity constraints", () => {
       .run("session", "chat", "thread", "fake", "project", "/workspace/project", "invalid", 0, 0),
   ).toThrow();
 
+  db.close();
+});
+
+test("upgrades a v4 database to v5 without losing execution state", async () => {
+  const db = new Database(":memory:");
+  const initial = new SqlitePersistence(db);
+  initial.saveProject({
+    id: "project",
+    name: "Project",
+    workspacePath: "/workspace/project",
+    allowedExecutorIds: ["fake"],
+  });
+  db.query(
+    `INSERT INTO bot_sessions
+      (id, telegram_chat_id, telegram_thread_id, executor_id, project_id, workspace_path, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run("session", "chat", "thread", "fake", "project", "/workspace/project", "failed", 1, 2);
+  db.query(
+    `INSERT INTO executions
+      (id, bot_session_id, requested_by_user_id, prompt, status, correlation_id, owner_fence)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run("execution", "session", "operator", "ambiguous", "unknown", "correlation", 3);
+  db.run("DROP TABLE execution_reconciliations");
+  db.query("DELETE FROM schema_migrations WHERE version=5").run();
+
+  const upgraded = new SqlitePersistence(db);
+  expect(
+    db
+      .query<{ version: number }, any>("SELECT MAX(version) AS version FROM schema_migrations")
+      .get()?.version,
+  ).toBe(5);
+  expect(await upgraded.executions.getById("execution")).toMatchObject({
+    status: "unknown",
+    ownerFence: 3,
+  });
+  expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
   db.close();
 });
 
@@ -113,6 +149,7 @@ function logicalSchema(db: Database): Record<string, unknown> {
     "bot_sessions",
     "executions",
     "execution_jobs",
+    "execution_reconciliations",
     "telegram_topics",
     "audit_log",
   ];
@@ -208,7 +245,7 @@ test("migrates the exact pre-M2 SQLite schema without losing runtime state", asy
       upgraded.db
         .query<{ version: number }, any>("SELECT version FROM schema_migrations ORDER BY version")
         .all(),
-    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
     expect(await upgraded.projects.getById("project")).toMatchObject({
       id: "project",
       workspacePath: "/workspace/project",

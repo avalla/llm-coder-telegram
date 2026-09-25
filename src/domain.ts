@@ -53,6 +53,21 @@ export interface Execution {
   cancelRequestedByUserId?: string | undefined;
 }
 
+export type ExecutionReconciliationOutcome = "confirmed_completed" | "abandoned";
+
+export interface ExecutionReconciliation {
+  executionId: string;
+  outcome: ExecutionReconciliationOutcome;
+  reconciledByUserId: string;
+  note: string;
+  reconciledAt: Date;
+}
+
+export type ExecutionReconciliationResult =
+  | { status: "reconciled"; reconciliation: ExecutionReconciliation }
+  | { status: "already_reconciled"; reconciliation: ExecutionReconciliation }
+  | { status: "not_found" | "wrong_session" | "not_unknown" };
+
 export interface ExecutionJob {
   executionId: string;
 }
@@ -309,6 +324,15 @@ export interface ExecutionRepository {
   recoverAfterRestart(now: Date): Promise<readonly Execution[]>;
 }
 
+export interface ExecutionReconciliationRepository {
+  listBySession(sessionId: string): Promise<readonly ExecutionReconciliation[]>;
+  reconcile(
+    executionId: string,
+    botSessionId: string,
+    reconciliation: ExecutionReconciliation,
+  ): Promise<ExecutionReconciliationResult>;
+}
+
 export interface ExecutorSessionRepository {
   getById(id: string): Promise<ExecutorSession | undefined>;
   save(session: ExecutorSession): Promise<void>;
@@ -344,5 +368,6 @@ export interface Persistence {
   executions: ExecutionRepository;
   executorSessions: ExecutorSessionRepository;
   topics: TelegramTopicRepository;
+  reconciliations: ExecutionReconciliationRepository;
   audit: AuditLog;
 }

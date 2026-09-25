@@ -9,6 +9,8 @@ import {
   type ChatGateway,
   type Execution,
   type ExecutionJob,
+  type ExecutionReconciliation,
+  type ExecutionReconciliationOutcome,
   type ExecutionJobDisposition,
   type ExecutionJobQueue,
   type ExecutionJobWorker,
@@ -297,6 +299,7 @@ class StaleExecutionOwnershipError extends Error {
 
 const EXECUTION_LEASE_MS = 30_000;
 const CANCELLATION_POLL_MS = 100;
+const RECONCILIATION_RETRY_MS = 1_000;
 
 type StreamResult =
   | { status: "completed"; message: string }
@@ -329,14 +332,7 @@ export class AgentOrchestrator {
     const recovered = await this.persistence.executions.recoverAfterRestart(this.clock.now());
     for (const execution of recovered) {
       if (execution.status === "unknown") {
-        const session = await this.persistence.sessions.getById(execution.botSessionId);
-        if (session && session.status !== "closed") {
-          await this.persistence.sessions.save({
-            ...session,
-            status: "failed",
-            updatedAt: this.clock.now(),
-          });
-        }
+        await this.quarantineUnknown(execution);
         await this.audit(
           "execution.recovered_unknown",
           execution.requestedByUserId,
@@ -481,12 +477,34 @@ export class AgentOrchestrator {
 
   private async handleSessionCommand(session: BotSession, message: IncomingMessage): Promise<void> {
     const command = message.text.trim();
+    const reconciliationCommand = parseReconcileCommand(command);
     this.authorization.authorize(
       message,
-      command === "/status" || command === "/session" || command === "/session info"
+      reconciliationCommand?.kind === "status" ||
+        command === "/status" ||
+        command === "/session" ||
+        command === "/session info"
         ? "viewer"
         : "operator",
     );
+    if (reconciliationCommand) {
+      if (reconciliationCommand.kind === "status") {
+        await this.gateway.sendMessage(
+          { chatId: session.telegramChatId, threadId: session.telegramThreadId },
+          await this.reconciliationStatusText(session),
+        );
+      } else {
+        await this.reconcileExecution(session, message, reconciliationCommand);
+      }
+      return;
+    }
+    if (command.startsWith("/reconcile")) {
+      await this.gateway.sendMessage(
+        { chatId: session.telegramChatId, threadId: session.telegramThreadId },
+        "Invalid reconciliation command. Use /reconcile status, /reconcile <execution-id> complete <reason>, or /reconcile <execution-id> abandon <reason>.",
+      );
+      return;
+    }
     switch (command) {
       case "/status":
       case "/session":
@@ -516,7 +534,7 @@ export class AgentOrchestrator {
       default:
         await this.gateway.sendMessage(
           { chatId: session.telegramChatId, threadId: session.telegramThreadId },
-          "Unknown command. Try /status, /session, /stop or /close.",
+          "Unknown command. Try /status, /session, /stop, /close or /reconcile status.",
         );
     }
   }
@@ -526,6 +544,14 @@ export class AgentOrchestrator {
     const current = await this.persistence.sessions.getById(session.id);
     if (!current) throw new Error(`Unknown session: ${session.id}`);
     if (current.status === "closed") throw new Error("Session is closed");
+    const unresolved = await this.unresolvedUnknownExecutions(current.id);
+    if (unresolved.length > 0) {
+      await this.gateway.sendMessage(
+        { chatId: current.telegramChatId, threadId: current.telegramThreadId },
+        `This session is blocked by unresolved execution ambiguity: ${unresolved.map((execution) => execution.id).join(", ")}. Reconciliation is required; use /reconcile status.`,
+      );
+      return;
+    }
 
     const execution: Execution = {
       id: crypto.randomUUID(),
@@ -565,9 +591,11 @@ export class AgentOrchestrator {
     );
     if (!lease) {
       const execution = await this.persistence.executions.getById(job.executionId);
-      return execution?.status === "pending"
-        ? { disposition: "retry", delayMs: CANCELLATION_POLL_MS }
-        : { disposition: "ack" };
+      if (execution?.status !== "pending") return { disposition: "ack" };
+      const unresolved = await this.unresolvedUnknownExecutions(execution.botSessionId);
+      return unresolved.length > 0
+        ? { disposition: "retry", delayMs: RECONCILIATION_RETRY_MS }
+        : { disposition: "retry", delayMs: CANCELLATION_POLL_MS };
     }
     const execution = await this.persistence.executions.getById(job.executionId);
     if (!execution) return { disposition: "ack" };
@@ -765,18 +793,21 @@ export class AgentOrchestrator {
     lease: ExecutionLease,
     result: StreamResult,
   ): Promise<void> {
-    await this.persistence.executions.updateOwned(
-      {
-        ...execution,
-        status: result.status,
-        finishedAt: this.clock.now(),
-        ownerFence: lease.fence,
-        errorMessage: result.status === "completed" ? undefined : result.message,
-      },
+    const finishedAt = this.clock.now();
+    const updatedExecution: Execution = {
+      ...execution,
+      status: result.status,
+      finishedAt,
+      ownerFence: lease.fence,
+      errorMessage: result.status === "completed" ? undefined : result.message,
+    };
+    const updated = await this.persistence.executions.updateOwned(
+      updatedExecution,
       lease.ownerId,
       lease.fence,
-      this.clock.now(),
+      finishedAt,
     );
+    if (updated && result.status === "unknown") await this.quarantineUnknown(updatedExecution);
   }
 
   private async finish(
@@ -827,6 +858,7 @@ export class AgentOrchestrator {
       return;
     }
     active.execution = finalExecution;
+    if (finalStatus.status === "unknown") await this.quarantineUnknown(finalExecution);
     if (renderer) {
       await renderer.complete(
         finalStatus.status === "completed"
@@ -1084,6 +1116,7 @@ export class AgentOrchestrator {
 
   private async statusText(session: BotSession): Promise<string> {
     const executions = await this.persistence.executions.listBySession(session.id);
+    const unresolved = await this.unresolvedUnknownExecutions(session.id);
     const last = executions.at(-1);
     const executorSession = session.executorSessionId
       ? await this.persistence.executorSessions.getById(session.executorSessionId)
@@ -1104,11 +1137,117 @@ export class AgentOrchestrator {
       `Runtime session: ${runtimeSession?.runtimeSessionId ?? "not active"}`,
       `Executor: ${executor.name} (${executor.id})`,
       `Native session: ${executorSession?.nativeSessionId ?? "not established"}`,
-      `Status: ${session.status}`,
+      `Status: ${session.status}${unresolved.length > 0 ? " (unresolved execution ambiguity)" : ""}`,
       `Active execution: ${activeExecution?.status ?? active?.execution.status ?? "none"}`,
       `Resume supported: ${executor.capabilities().resume ? "yes" : "no"}`,
       `Last execution: ${last?.status ?? "none"}`,
+      `Unresolved ambiguity: ${unresolved.length > 0 ? unresolved.map((execution) => execution.id).join(", ") + " (use /reconcile status)" : "none"}`,
     ].join("\n");
+  }
+
+  private async unresolvedUnknownExecutions(sessionId: string): Promise<readonly Execution[]> {
+    const [executions, reconciliations] = await Promise.all([
+      this.persistence.executions.listBySession(sessionId),
+      this.persistence.reconciliations.listBySession(sessionId),
+    ]);
+    const reconciled = new Set(reconciliations.map((item) => item.executionId));
+    return executions.filter(
+      (execution) => execution.status === "unknown" && !reconciled.has(execution.id),
+    );
+  }
+
+  private async quarantineUnknown(execution: Execution): Promise<void> {
+    const session = await this.persistence.sessions.getById(execution.botSessionId);
+    if (session && session.status !== "closed" && session.status !== "failed") {
+      await this.persistence.sessions.save({
+        ...session,
+        status: "failed",
+        updatedAt: this.clock.now(),
+      });
+    }
+    await this.audit(
+      "execution.reconciliation_required",
+      execution.requestedByUserId,
+      execution.botSessionId,
+      execution.id,
+      session?.telegramChatId,
+      execution.correlationId,
+      execution.errorMessage ? { reason: execution.errorMessage } : undefined,
+    );
+  }
+
+  private async reconciliationStatusText(session: BotSession): Promise<string> {
+    const executions = await this.persistence.executions.listBySession(session.id);
+    const reconciliations = await this.persistence.reconciliations.listBySession(session.id);
+    const byExecution = new Map(reconciliations.map((item) => [item.executionId, item]));
+    const unknown = executions.filter((execution) => execution.status === "unknown");
+    if (unknown.length === 0) return "No executions with uncertain provider outcome.";
+    return [
+      "Execution reconciliation status:",
+      ...unknown.map((execution) => {
+        const reconciliation = byExecution.get(execution.id);
+        return [
+          `Execution ID: ${execution.id}`,
+          `Correlation ID: ${execution.correlationId}`,
+          `Started: ${execution.startedAt?.toISOString() ?? "not recorded"}`,
+          `Finished: ${execution.finishedAt?.toISOString() ?? "not recorded"}`,
+          `Unknown reason: ${execution.errorMessage ?? "not recorded"}`,
+          `Reconciliation: ${reconciliation?.outcome ?? "unresolved"}`,
+        ].join("\n");
+      }),
+      "Use /reconcile <execution-id> complete <reason> or /reconcile <execution-id> abandon <reason>.",
+    ].join("\n\n");
+  }
+
+  private async reconcileExecution(
+    session: BotSession,
+    message: IncomingMessage,
+    command: ReconcileMutationCommand,
+  ): Promise<void> {
+    const reconciliation: ExecutionReconciliation = {
+      executionId: command.executionId,
+      outcome: command.outcome,
+      reconciledByUserId: message.userId,
+      note: command.note,
+      reconciledAt: this.clock.now(),
+    };
+    const result = await this.persistence.reconciliations.reconcile(
+      command.executionId,
+      session.id,
+      reconciliation,
+    );
+    const target = { chatId: session.telegramChatId, threadId: session.telegramThreadId };
+    if (result.status === "reconciled") {
+      const execution = await this.persistence.executions.getById(command.executionId);
+      await this.audit(
+        "execution.reconciled",
+        message.userId,
+        session.id,
+        command.executionId,
+        session.telegramChatId,
+        execution?.correlationId,
+        { outcome: result.reconciliation.outcome },
+      );
+      await this.gateway.sendMessage(
+        target,
+        `Execution ${command.executionId} reconciled as ${result.reconciliation.outcome}. The execution remains historically unknown; no provider call was made.`,
+      );
+      return;
+    }
+    if (result.status === "already_reconciled") {
+      await this.gateway.sendMessage(
+        target,
+        `Execution ${command.executionId} was already reconciled as ${result.reconciliation.outcome}; no changes were made.`,
+      );
+      return;
+    }
+    const messageText =
+      result.status === "not_found"
+        ? `Cannot reconcile execution ${command.executionId}: execution ID was not found.`
+        : result.status === "wrong_session"
+          ? "Cannot reconcile that execution from this BotSession."
+          : "Cannot reconcile this execution because it is not unknown.";
+    await this.gateway.sendMessage(target, messageText);
   }
 
   private async requireProject(id: string): Promise<Project> {
@@ -1124,6 +1263,7 @@ export class AgentOrchestrator {
     executionId?: string,
     chatId?: string,
     correlationId: string = crypto.randomUUID(),
+    metadata?: Readonly<Record<string, string>>,
   ): Promise<void> {
     await this.persistence.audit.append({
       action,
@@ -1132,12 +1272,35 @@ export class AgentOrchestrator {
       correlationId,
       ...(executionId ? { executionId } : {}),
       ...(chatId ? { chatId } : {}),
+      ...(metadata ? { metadata } : {}),
     });
   }
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
+}
+
+export interface ReconcileMutationCommand {
+  kind: "mutation";
+  executionId: string;
+  outcome: ExecutionReconciliationOutcome;
+  note: string;
+}
+
+export function parseReconcileCommand(
+  text: string,
+): { kind: "status" } | ReconcileMutationCommand | undefined {
+  const command = text.trim();
+  if (command === "/reconcile" || command === "/reconcile status") return { kind: "status" };
+  const match = command.match(/^\/reconcile\s+(\S+)\s+(complete|abandon)\s+([\s\S]+)$/);
+  if (!match?.[1] || !match[3]?.trim()) return undefined;
+  return {
+    kind: "mutation",
+    executionId: match[1],
+    outcome: match[2] === "complete" ? "confirmed_completed" : "abandoned",
+    note: match[3].trim(),
+  };
 }
 
 export function parseNewCommand(

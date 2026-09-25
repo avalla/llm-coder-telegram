@@ -3,6 +3,7 @@ import {
   type AgentExecutor,
   type AgentInput,
   type AgentSession,
+  type AuditLog,
   type ExecutorCapabilities,
   type BotSession,
   type BotSessionRepository,
@@ -229,10 +230,14 @@ export class InMemoryPersistence implements Persistence {
   readonly projects = new InMemoryProjects();
   readonly executions = new InMemoryExecutions();
   readonly sessions = new InMemorySessions(this.executions);
-  readonly reconciliations = new InMemoryReconciliations(this.executions, this.sessions);
+  readonly audit = new InMemoryAuditLog();
+  readonly reconciliations = new InMemoryReconciliations(
+    this.executions,
+    this.sessions,
+    this.audit,
+  );
   readonly executorSessions = new InMemoryExecutorSessions(this.executions);
   readonly topics = new InMemoryTopics();
-  readonly audit = new InMemoryAuditLog();
 }
 
 class InMemoryProjects implements ProjectRepository {
@@ -481,6 +486,7 @@ class InMemoryReconciliations implements ExecutionReconciliationRepository {
   constructor(
     private readonly executions: InMemoryExecutions,
     private readonly sessions: InMemorySessions,
+    private readonly audit: AuditLog,
   ) {}
 
   async listBySession(sessionId: string): Promise<readonly ExecutionReconciliation[]> {
@@ -527,6 +533,15 @@ class InMemoryReconciliations implements ExecutionReconciliationRepository {
           updatedAt: reconciliation.reconciledAt,
         });
       }
+      await this.audit.append({
+        action: "execution.reconciled",
+        userId: reconciledByUserId,
+        ...(session ? { chatId: session.telegramChatId } : {}),
+        sessionId: botSessionId,
+        executionId,
+        correlationId: execution.correlationId,
+        metadata: { outcome: saved.outcome },
+      });
       return { status: "reconciled", reconciliation: saved };
     } finally {
       release();

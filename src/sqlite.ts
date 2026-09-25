@@ -351,18 +351,22 @@ function migrate(db: Database): void {
 
     if (!tableExists(db, "projects")) {
       createCanonicalSchema(db);
+      for (const completedVersion of [1, 2, 3, 4, 5]) {
+        recordSchemaVersion(db, completedVersion);
+      }
     } else if (version < 3) {
       rebuildPreM2OrIncompleteSchema(db);
-    } else if (version < 4) {
-      upgradeToM3Schema(db);
-    } else if (version < 5) {
-      upgradeToM4Schema(db);
-    }
-    for (const completedVersion of [1, 2, 3, 4, 5]) {
-      if (version < completedVersion) {
-        db.query("INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)").run(
-          completedVersion,
-        );
+      for (const completedVersion of [1, 2, 3, 4, 5]) {
+        recordSchemaVersion(db, completedVersion);
+      }
+    } else {
+      if (version < 4) {
+        upgradeToM3Schema(db);
+        recordSchemaVersion(db, 4);
+      }
+      if (version < 5) {
+        upgradeToM4Schema(db);
+        recordSchemaVersion(db, 5);
       }
     }
     db.run("COMMIT");
@@ -370,6 +374,10 @@ function migrate(db: Database): void {
     db.run("ROLLBACK");
     throw error;
   }
+}
+
+function recordSchemaVersion(db: Database, version: number): void {
+  db.query("INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)").run(version);
 }
 
 function upgradeToM3Schema(db: Database): void {
@@ -1252,8 +1260,17 @@ class SqliteReconciliations implements ExecutionReconciliationRepository {
     this.db.run("BEGIN IMMEDIATE");
     try {
       const execution = this.db
-        .query<{ bot_session_id: string; status: string }, any>(
-          "SELECT bot_session_id, status FROM executions WHERE id=?",
+        .query<
+          {
+            bot_session_id: string;
+            status: string;
+            correlation_id: string;
+            telegram_chat_id: string;
+          },
+          any
+        >(
+          `SELECT e.bot_session_id, e.status, e.correlation_id, s.telegram_chat_id
+           FROM executions e JOIN bot_sessions s ON s.id=e.bot_session_id WHERE e.id=?`,
         )
         .get(executionId);
       if (!execution) {
@@ -1307,6 +1324,21 @@ class SqliteReconciliations implements ExecutionReconciliationRepository {
            END, updated_at=? WHERE id=?`,
         )
         .run(reconciliation.reconciledAt.getTime(), botSessionId);
+      this.db
+        .query(
+          `INSERT INTO audit_log
+             (action, user_id, chat_id, session_id, execution_id, correlation_id, metadata, created_at)
+           VALUES ('execution.reconciled', ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          reconciledByUserId,
+          execution.telegram_chat_id,
+          botSessionId,
+          executionId,
+          execution.correlation_id,
+          JSON.stringify({ outcome: reconciliation.outcome }),
+          reconciliation.reconciledAt.getTime(),
+        );
       this.db.run("COMMIT");
       return {
         status: "reconciled",

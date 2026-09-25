@@ -87,7 +87,11 @@ test("parses only the explicit reconciliation commands and requires a reason", (
 test("viewer can inspect unknown safely, while operator reconciliation is immutable", async () => {
   const { persistence, gateway, executor, orchestrator } = inMemoryFixture();
   const session = await createSession(orchestrator);
-  const execution = unknownExecution(session.id);
+  const sensitiveProviderError = "provider-token=secret raw-argv=--api-key";
+  const execution = {
+    ...unknownExecution(session.id, "sensitive prompt"),
+    errorMessage: sensitiveProviderError,
+  };
   await persistence.executions.save(execution);
   await persistence.sessions.save({ ...session, status: "failed" });
 
@@ -97,10 +101,13 @@ test("viewer can inspect unknown safely, while operator reconciliation is immuta
   const status = gateway.sent.at(-1)?.text ?? "";
   expect(status).toContain(execution.id);
   expect(status).toContain(execution.correlationId);
-  expect(status).toContain("Executor stream ended");
+  expect(status).not.toContain(sensitiveProviderError);
   expect(status).not.toContain(execution.prompt);
   await orchestrator.handleMessage(message(session.telegramThreadId, "viewer", "/status"));
-  expect(gateway.sent.at(-1)?.text).toContain("unresolved execution ambiguity");
+  const sessionStatus = gateway.sent.at(-1)?.text ?? "";
+  expect(sessionStatus).toContain("unresolved execution ambiguity");
+  expect(sessionStatus).not.toContain(sensitiveProviderError);
+  expect(sessionStatus).not.toContain(execution.prompt);
 
   await expect(
     orchestrator.handleMessage(

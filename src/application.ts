@@ -1191,7 +1191,6 @@ export class AgentOrchestrator {
           `Correlation ID: ${execution.correlationId}`,
           `Started: ${execution.startedAt?.toISOString() ?? "not recorded"}`,
           `Finished: ${execution.finishedAt?.toISOString() ?? "not recorded"}`,
-          `Unknown reason: ${execution.errorMessage ?? "not recorded"}`,
           `Reconciliation: ${reconciliation?.outcome ?? "unresolved"}`,
         ].join("\n");
       }),
@@ -1218,16 +1217,6 @@ export class AgentOrchestrator {
     );
     const target = { chatId: session.telegramChatId, threadId: session.telegramThreadId };
     if (result.status === "reconciled") {
-      const execution = await this.persistence.executions.getById(command.executionId);
-      await this.audit(
-        "execution.reconciled",
-        message.userId,
-        session.id,
-        command.executionId,
-        session.telegramChatId,
-        execution?.correlationId,
-        { outcome: result.reconciliation.outcome },
-      );
       await this.gateway.sendMessage(
         target,
         `Execution ${command.executionId} reconciled as ${result.reconciliation.outcome}. The execution remains historically unknown; no provider call was made.`,

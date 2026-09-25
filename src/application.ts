@@ -801,12 +801,20 @@ export class AgentOrchestrator {
       ownerFence: lease.fence,
       errorMessage: result.status === "completed" ? undefined : result.message,
     };
-    const updated = await this.persistence.executions.updateOwned(
-      updatedExecution,
-      lease.ownerId,
-      lease.fence,
-      finishedAt,
-    );
+    const updated =
+      result.status === "unknown"
+        ? await this.persistence.executions.updateOwnedUnknown(
+            { ...updatedExecution, status: "unknown" },
+            lease.ownerId,
+            lease.fence,
+            finishedAt,
+          )
+        : await this.persistence.executions.updateOwned(
+            updatedExecution,
+            lease.ownerId,
+            lease.fence,
+            finishedAt,
+          );
     if (updated && result.status === "unknown") await this.quarantineUnknown(updatedExecution);
   }
 
@@ -839,7 +847,7 @@ export class AgentOrchestrator {
           : finalStatus.status === "stopped"
             ? "stopped"
             : "failed";
-    if (current) {
+    if (current && finalStatus.status !== "unknown") {
       await this.persistOwnedSession(active, {
         ...current,
         ...(executorSessionId ? { executorSessionId } : {}),
@@ -847,12 +855,20 @@ export class AgentOrchestrator {
         updatedAt: finishedAt,
       });
     }
-    const updated = await this.persistence.executions.updateOwned(
-      finalExecution,
-      active.lease.ownerId,
-      active.lease.fence,
-      finishedAt,
-    );
+    const updated =
+      finalStatus.status === "unknown"
+        ? await this.persistence.executions.updateOwnedUnknown(
+            { ...finalExecution, status: "unknown" },
+            active.lease.ownerId,
+            active.lease.fence,
+            finishedAt,
+          )
+        : await this.persistence.executions.updateOwned(
+            finalExecution,
+            active.lease.ownerId,
+            active.lease.fence,
+            finishedAt,
+          );
     if (!updated) {
       active.ownershipLost = true;
       return;
@@ -1158,13 +1174,6 @@ export class AgentOrchestrator {
 
   private async quarantineUnknown(execution: Execution): Promise<void> {
     const session = await this.persistence.sessions.getById(execution.botSessionId);
-    if (session && session.status !== "closed" && session.status !== "failed") {
-      await this.persistence.sessions.save({
-        ...session,
-        status: "failed",
-        updatedAt: this.clock.now(),
-      });
-    }
     await this.audit(
       "execution.reconciliation_required",
       execution.requestedByUserId,
@@ -1172,7 +1181,6 @@ export class AgentOrchestrator {
       execution.id,
       session?.telegramChatId,
       execution.correlationId,
-      execution.errorMessage ? { reason: execution.errorMessage } : undefined,
     );
   }
 

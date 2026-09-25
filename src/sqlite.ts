@@ -913,9 +913,13 @@ class SqliteExecutions implements ExecutionRepository {
       if (execution.status === "unknown") {
         this.db
           .query(
-            "UPDATE bot_sessions SET status=CASE WHEN status='closed' THEN 'closed' ELSE 'failed' END, updated_at=? WHERE id=?",
+            `UPDATE bot_sessions
+             SET status=CASE WHEN status='closed' THEN 'closed' ELSE 'failed' END, updated_at=?
+             WHERE id=? AND NOT EXISTS (
+               SELECT 1 FROM execution_reconciliations WHERE execution_id=?
+             )`,
           )
-          .run(Date.now(), execution.botSessionId);
+          .run(Date.now(), execution.botSessionId, execution.id);
       }
       if (execution.status === "pending") {
         const now = Date.now();
@@ -1056,6 +1060,9 @@ class SqliteExecutions implements ExecutionRepository {
     fence: number,
     now: Date,
   ): Promise<boolean> {
+    if (execution.status === "unknown") {
+      return this.updateOwnedUnknown({ ...execution, status: "unknown" }, ownerId, fence, now);
+    }
     const result = this.db
       .query(
         `UPDATE executions
@@ -1073,16 +1080,14 @@ class SqliteExecutions implements ExecutionRepository {
         execution.status === "completed" ||
           execution.status === "failed" ||
           execution.status === "stopped" ||
-          execution.status === "interrupted" ||
-          execution.status === "unknown"
+          execution.status === "interrupted"
           ? null
           : ownerId,
         fence,
         execution.status === "completed" ||
           execution.status === "failed" ||
           execution.status === "stopped" ||
-          execution.status === "interrupted" ||
-          execution.status === "unknown"
+          execution.status === "interrupted"
           ? null
           : (execution.leaseExpiresAt?.getTime() ?? null),
         execution.cancelRequestedAt?.getTime() ?? null,
@@ -1093,6 +1098,62 @@ class SqliteExecutions implements ExecutionRepository {
         now.getTime(),
       );
     return result.changes === 1;
+  }
+
+  async updateOwnedUnknown(
+    execution: Execution & { status: "unknown" },
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    if (execution.status !== "unknown") {
+      throw new Error("Owned unknown update requires an unknown execution.");
+    }
+    const nowMs = now.getTime();
+    this.db.run("BEGIN IMMEDIATE");
+    try {
+      const result = this.db
+        .query(
+          `UPDATE executions
+           SET status='unknown', executor_session_id=?, started_at=?, finished_at=?, error_message=?,
+               owner_id=NULL, owner_fence=?, lease_expires_at=NULL,
+               cancel_requested_at=?, cancel_requested_by_user_id=?
+           WHERE id=? AND bot_session_id=? AND owner_id=? AND owner_fence=?
+             AND status IN ('running', 'awaiting_approval')
+             AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
+        )
+        .run(
+          execution.executorSessionId ?? null,
+          execution.startedAt?.getTime() ?? null,
+          execution.finishedAt?.getTime() ?? null,
+          execution.errorMessage ?? null,
+          fence,
+          execution.cancelRequestedAt?.getTime() ?? null,
+          execution.cancelRequestedByUserId ?? null,
+          execution.id,
+          execution.botSessionId,
+          ownerId,
+          fence,
+          nowMs,
+        );
+      if (result.changes !== 1) {
+        this.db.run("COMMIT");
+        return false;
+      }
+      const session = this.db
+        .query(
+          `UPDATE bot_sessions
+           SET status=CASE WHEN status='closed' THEN 'closed' ELSE 'failed' END, updated_at=?
+           WHERE id=?`,
+        )
+        .run(nowMs, execution.botSessionId);
+      if (session.changes !== 1) throw new Error("Unknown execution BotSession was not found.");
+      this.db.run("COMMIT");
+      return true;
+    } catch (error) {
+      this.db.run("ROLLBACK");
+      throw error;
+    }
   }
 
   async requestCancellation(
@@ -1166,6 +1227,19 @@ class SqliteExecutions implements ExecutionRepository {
            WHERE status IN ('running', 'awaiting_approval')`,
         )
         .run(nowMs, "Execution owner was lost during restart; provider state was not guessed.");
+      this.db
+        .query(
+          `UPDATE bot_sessions
+           SET status='failed', updated_at=?
+           WHERE status <> 'closed' AND id IN (
+             SELECT e.bot_session_id FROM executions e
+             WHERE e.status='unknown'
+               AND NOT EXISTS (
+                 SELECT 1 FROM execution_reconciliations r WHERE r.execution_id=e.id
+               )
+           )`,
+        )
+        .run(nowMs);
       const interrupted = interruptedIds
         .map((id) =>
           this.map(

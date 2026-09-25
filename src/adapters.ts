@@ -231,6 +231,10 @@ export class InMemoryPersistence implements Persistence {
   readonly executions = new InMemoryExecutions();
   readonly sessions = new InMemorySessions(this.executions);
   readonly audit = new InMemoryAuditLog();
+
+  constructor() {
+    this.executions.attachSessions(this.sessions);
+  }
   readonly reconciliations = new InMemoryReconciliations(
     this.executions,
     this.sessions,
@@ -270,6 +274,12 @@ class InMemorySessions implements BotSessionRepository {
     this.values.set(session.id, session);
   }
 
+  quarantineUnknown(sessionId: string, now: Date): void {
+    const session = this.values.get(sessionId);
+    if (!session || session.status === "closed") return;
+    this.values.set(sessionId, { ...session, status: "failed", updatedAt: now });
+  }
+
   async updateOwned(
     session: BotSession,
     executionId: string,
@@ -300,6 +310,11 @@ class InMemorySessions implements BotSessionRepository {
 class InMemoryExecutions implements ExecutionRepository {
   private readonly values = new Map<string, Execution>();
   private readonly reconciledExecutionIds = new Set<string>();
+  private sessions?: InMemorySessions;
+
+  attachSessions(sessions: InMemorySessions): void {
+    this.sessions = sessions;
+  }
 
   markReconciled(executionId: string): void {
     this.reconciledExecutionIds.add(executionId);
@@ -320,6 +335,9 @@ class InMemoryExecutions implements ExecutionRepository {
 
   async save(execution: Execution): Promise<void> {
     this.values.set(execution.id, execution);
+    if (execution.status === "unknown" && this.hasUnresolvedUnknown(execution.botSessionId)) {
+      this.sessions?.quarantineUnknown(execution.botSessionId, new Date());
+    }
   }
 
   async listBySession(sessionId: string): Promise<readonly Execution[]> {
@@ -395,6 +413,9 @@ class InMemoryExecutions implements ExecutionRepository {
     fence: number,
     now: Date,
   ): Promise<boolean> {
+    if (execution.status === "unknown") {
+      return this.updateOwnedUnknown({ ...execution, status: "unknown" }, ownerId, fence, now);
+    }
     const current = this.values.get(execution.id);
     if (
       !current ||
@@ -410,11 +431,41 @@ class InMemoryExecutions implements ExecutionRepository {
       ...(execution.status === "completed" ||
       execution.status === "failed" ||
       execution.status === "stopped" ||
-      execution.status === "interrupted" ||
-      execution.status === "unknown"
+      execution.status === "interrupted"
         ? { ownerId: undefined, leaseExpiresAt: undefined }
         : { ownerId, leaseExpiresAt: execution.leaseExpiresAt }),
     });
+    return true;
+  }
+
+  async updateOwnedUnknown(
+    execution: Execution & { status: "unknown" },
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean> {
+    if (execution.status !== "unknown") {
+      throw new Error("Owned unknown update requires an unknown execution.");
+    }
+    const current = this.values.get(execution.id);
+    if (
+      !current ||
+      current.botSessionId !== execution.botSessionId ||
+      current.ownerId !== ownerId ||
+      current.ownerFence !== fence ||
+      (current.status !== "running" && current.status !== "awaiting_approval") ||
+      !current.leaseExpiresAt ||
+      current.leaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    this.values.set(execution.id, {
+      ...execution,
+      ownerId: undefined,
+      ownerFence: fence,
+      leaseExpiresAt: undefined,
+    });
+    this.sessions?.quarantineUnknown(execution.botSessionId, now);
     return true;
   }
 
@@ -463,6 +514,11 @@ class InMemoryExecutions implements ExecutionRepository {
         };
         this.values.set(execution.id, updated);
         recovered.push(updated);
+      }
+    }
+    for (const execution of this.values.values()) {
+      if (execution.status === "unknown" && this.hasUnresolvedUnknown(execution.botSessionId)) {
+        this.sessions?.quarantineUnknown(execution.botSessionId, now);
       }
     }
     const pending = [...this.values.values()].filter((execution) => execution.status === "pending");

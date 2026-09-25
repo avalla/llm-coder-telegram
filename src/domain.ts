@@ -316,6 +316,12 @@ export interface ExecutionRepository {
     leaseDurationMs: number,
   ): Promise<boolean>;
   updateOwned(execution: Execution, ownerId: string, fence: number, now: Date): Promise<boolean>;
+  updateOwnedUnknown(
+    execution: Execution & { status: "unknown" },
+    ownerId: string,
+    fence: number,
+    now: Date,
+  ): Promise<boolean>;
   requestCancellation(
     executionId: string,
     requestedByUserId: string,
